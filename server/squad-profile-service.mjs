@@ -48,7 +48,7 @@ async function fetchText(url, headers) {
   throw lastError;
 }
 
-function normalizeCoachProfile(payload) {
+function normalizeCoachProfile(payload, profileCoachImage = null) {
   const coach = payload?.coachinfo || {};
   return {
     formation: null,
@@ -57,7 +57,8 @@ function normalizeCoachProfile(payload) {
     coach: plainText(coach.name) ? {
       id: String(coach.id || payload.coach || ""),
       name: plainText(coach.name),
-      image: safeImage(coach.thumb),
+      image: profileCoachImage || safeImage(coach.thumb),
+      profileImageResolved: Boolean(profileCoachImage),
       description: plainText(coach.desc) || null,
       abilities: splitEffects(coach.ability),
       formations: splitEffects(coach.formation),
@@ -164,7 +165,8 @@ async function fetchCoachProfile(nexonSn) {
     "user-agent": "FC-SUPPORT/1.0",
     "x-requested-with": "XMLHttpRequest",
   });
-  return normalizeCoachProfile(JSON.parse(detailText));
+  const profileCoachImage = safeImage(profileHtml.match(/class=["']squadmaker-aside__coach["'][\s\S]*?<img[^>]+src=["']([^"']+)["']/i)?.[1]);
+  return normalizeCoachProfile(JSON.parse(detailText), profileCoachImage);
 }
 
 export async function getSquadProfile(nickname) {
@@ -186,7 +188,8 @@ export async function getSquadProfile(nickname) {
   if (cached) {
     const cachedProfile = JSON.parse(cached.payload_json);
     const needsLatestMatchPlayers = cachedProfile.sourceKind !== SQUAD_MAKER_SOURCE_KIND
-      || cachedProfile.sourceMatchId !== (ranker.match_id || null);
+      || cachedProfile.sourceMatchId !== (ranker.match_id || null)
+      || (cachedProfile.coach && cachedProfile.coach.profileImageResolved !== true);
     if (needsLatestMatchPlayers) {
       const coachProfile = await fetchCoachProfile(ranker.nexon_sn);
       const matchProfile = enrichPlayerMetadata(latestMatchProfile(snapshot.id, ranker.id, ranker.match_id, coachProfile));

@@ -41,6 +41,60 @@ function rankingItem(row) {
   };
 }
 
+let homeInsightsCache = { snapshotId: null, value: null };
+
+export function homeRankingInsights() {
+  const snapshot = getActiveSnapshot();
+  if (!snapshot) return { snapshot: null, formations: { sampleSize: 0, items: [] }, teamColors: { sampleSize: 0, items: [] } };
+  if (homeInsightsCache.snapshotId === Number(snapshot.id) && homeInsightsCache.value) return homeInsightsCache.value;
+
+  const formationRows = db.prepare(`
+    SELECT e.ranker_id, GROUP_CONCAT(pos.name, '|') AS position_names
+    FROM ranking_entries e
+    JOIN lineup_players l ON l.snapshot_id = e.snapshot_id AND l.ranker_id = e.ranker_id
+    JOIN position_metadata pos ON pos.position_id = l.position_id
+    WHERE e.snapshot_id = ? AND e.lineup_status = 'READY'
+    GROUP BY e.ranker_id
+  `).all(snapshot.id);
+  const formationCounts = new Map();
+  for (const row of formationRows) {
+    const formation = inferFormation(String(row.position_names || "").split("|").filter(Boolean));
+    if (formation) formationCounts.set(formation, (formationCounts.get(formation) || 0) + 1);
+  }
+  const formationSampleSize = [...formationCounts.values()].reduce((sum, count) => sum + count, 0);
+  const formations = [...formationCounts].map(([name, count]) => ({
+    name,
+    count,
+    rate: formationSampleSize ? Number(((count / formationSampleSize) * 100).toFixed(1)) : 0,
+  })).sort((left, right) => right.count - left.count || left.name.localeCompare(right.name, "ko-KR"));
+
+  const teamColorRows = db.prepare(`
+    SELECT
+      TRIM(primary_team_color) AS name,
+      COUNT(*) AS count,
+      MAX(NULLIF(TRIM(json_extract(team_colors_json, '$[0].image')), '')) AS image
+    FROM ranking_entries
+    WHERE snapshot_id = ? AND primary_team_color IS NOT NULL AND TRIM(primary_team_color) <> ''
+    GROUP BY TRIM(primary_team_color)
+    ORDER BY count DESC, name COLLATE NOCASE ASC
+  `).all(snapshot.id);
+  const teamColorSampleSize = teamColorRows.reduce((sum, row) => sum + Number(row.count), 0);
+  const teamColors = teamColorRows.map((row) => ({
+    name: row.name,
+    count: Number(row.count),
+    rate: teamColorSampleSize ? Number(((Number(row.count) / teamColorSampleSize) * 100).toFixed(1)) : 0,
+    image: row.image || null,
+  }));
+
+  const value = {
+    snapshot,
+    formations: { sampleSize: formationSampleSize, items: formations },
+    teamColors: { sampleSize: teamColorSampleSize, items: teamColors },
+  };
+  homeInsightsCache = { snapshotId: Number(snapshot.id), value };
+  return value;
+}
+
 export function listTeamColors() {
   const snapshot = getActiveSnapshot();
   if (!snapshot) return { snapshot: null, items: [] };
@@ -240,6 +294,38 @@ export function getPickRates({ rankStart, rankEnd, teamColor, position, offset, 
       pickRate: positionTotal === 0 ? 0 : Number(((Number(row.pick_count) / positionTotal) * 100).toFixed(2)),
     })),
   };
+}
+
+export function searchPlayers(query, limit = 18) {
+  const normalized = String(query || "").trim();
+  if (!normalized) return [];
+  const escaped = normalized.replace(/[\\%_]/g, (character) => `\\${character}`);
+  return db.prepare(`
+    SELECT spid, pid, season_id, name, season_name, season_image
+    FROM player_metadata
+    WHERE name IS NOT NULL AND name LIKE ? ESCAPE '\\'
+    ORDER BY CASE WHEN name = ? THEN 0 WHEN name LIKE ? ESCAPE '\\' THEN 1 ELSE 2 END,
+             name ASC, season_id DESC, spid DESC
+    LIMIT ?
+  `).all(`%${escaped}%`, normalized, `${escaped}%`, limit).map((row) => ({
+    spid: String(row.spid),
+    pid: String(row.pid),
+    seasonId: Number(row.season_id),
+    name: row.name,
+    season: row.season_name,
+    seasonImage: row.season_image,
+  }));
+}
+
+export function getPlayerSeasonMetadata(spid) {
+  const row = db.prepare(`
+    SELECT season_name, season_image
+    FROM player_metadata
+    WHERE spid = ?
+    LIMIT 1
+  `).get(String(spid));
+  if (!row) return null;
+  return { season: row.season_name || null, seasonImage: row.season_image || null };
 }
 
 export function recentSnapshots(limit = 10) {

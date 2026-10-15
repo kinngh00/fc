@@ -1,8 +1,10 @@
 "use client";
 
-import { FormEvent, useEffect, useRef, useState, type CSSProperties } from "react";
-import { CommunitySection, openCommunityAuthEvent } from "./community";
-import { PortfolioSection } from "./portfolio";
+import { FormEvent, useEffect, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from "react";
+import { CommunityPreview } from "./community";
+import { SiteHeader, SiteFooter } from "./site-chrome";
+import { trackAnalytics } from "./analytics";
+import { MetaRankingContent, type MetaTab } from "./meta-ranking";
 
 type PickItem = {
   spid: string;
@@ -15,6 +17,9 @@ type PickItem = {
   position: string;
   count: number;
   pickRate: number;
+  adaptation: number;
+  ovr: number | null;
+  price: string | null;
 };
 
 type PickResponse = {
@@ -28,7 +33,33 @@ type PickResponse = {
   hasMore: boolean;
 };
 
-type Query = { start: string; end: string; team: string; position: string; detailed: boolean };
+export type PlayerDetail = {
+  spid: string;
+  grade: number;
+  name: string;
+  season: string | null;
+  seasonImage: string | null;
+  image: string | null;
+  ovr: number | null;
+  pay: number | null;
+  positions: Array<{ position: string; value: number }>;
+  birthDate: string | null;
+  height: string | null;
+  weight: string | null;
+  bodyType: string | null;
+  skillMoves: string | null;
+  foot: string | null;
+  footStrong: string | null;
+  nation: string | null;
+  nationImage: string | null;
+  traits: Array<{ name: string; image: string }>;
+  abilities: Array<{ name: string; value: number }>;
+  teamColors: Array<{ label: string; items: string[] }>;
+  career?: Array<{ year: string; club: string; loan: string | null }>;
+  market?: { currentPrice: string | null; history: Array<{ date: string; price: string }> };
+};
+
+type Query = { start: string; end: string; team: string; position: string; detailed: boolean; adaptation: number };
 
 type RankingItem = {
   rank: number;
@@ -59,6 +90,12 @@ type RankingResponse = {
   limit: number;
   hasMore: boolean;
 };
+type HomeInsightItem = { name: string; count: number; rate: number; image?: string | null };
+type HomeInsightsResponse = {
+  snapshot: { id: number; data_time: string } | null;
+  formations: { sampleSize: number; items: HomeInsightItem[] };
+  teamColors: { sampleSize: number; items: HomeInsightItem[] };
+};
 
 type HistoryItem = { dataTime: string; rank: number; clubValue: string; winRate: number | null };
 type HistoryFrame = "hour" | "day" | "week";
@@ -79,6 +116,16 @@ type UserProfileResponse = {
   profile: RankingItem & { hasOuid: boolean };
   history: HistoryItem[];
   squad: SquadItem[];
+};
+type LiveUserResponse = {
+  source: "nexon-live";
+  nickname: string;
+  ouid: string;
+  level: number | null;
+  nexonSn: string | null;
+  squad: { totalPrice?: number; totalPay?: number; players?: Array<{ spid?: number; name?: string }> } | null;
+  managerRecord: { wins: number; draws: number; losses: number; winRate: number } | null;
+  maxDivision: { matchType: number; division: number; divisionName: string; divisionImage: string | null; achievementDate: string } | null;
 };
 type MatchParticipant = {
   nickname: string | null; result: string | null; score: number; possession: number;
@@ -103,7 +150,6 @@ function positionGroup(position: string | null) {
   if (position && midfieldPositions.has(position)) return "midfield";
   return "defense";
 }
-
 function orderedSquad(items: SquadItem[]) {
   return [...items].sort((left, right) => {
     const leftIndex = positionPriority.indexOf(left.position || "");
@@ -113,9 +159,12 @@ function orderedSquad(items: SquadItem[]) {
     return normalizedLeft - normalizedRight || left.slot - right.slot;
   });
 }
-const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8787";
+const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL || "https://fc-support.kr";
+const managerSearchDraftKey = "fc-support:manager-search-draft";
+const managerSearchDraftSourceKey = "fc-support:manager-search-draft-source";
 const formationViewStorageKey = "fc-support:formation-view";
 const formationViewChangeEvent = "fc-support:formation-view-change";
+const rankingPageSize = 20;
 
 function seasonLabel(season: string | null) {
   return season?.split(" ")[0] || "시즌 정보 없음";
@@ -171,8 +220,11 @@ function clubValueLabel(value: string | null) {
   const amount = BigInt(value);
   const gyeong = amount / 10_000_000_000_000_000n;
   const jo = (amount % 10_000_000_000_000_000n) / 1_000_000_000_000n;
+  const eok = (amount % 1_000_000_000_000n) / 100_000_000n;
   if (gyeong > 0n) return `${gyeong.toLocaleString()}경 ${jo.toLocaleString()}조`;
-  return `${(amount / 1_000_000_000_000n).toLocaleString()}조`;
+  if (jo > 0n) return `${jo.toLocaleString()}조`;
+  if (eok > 0n) return `${eok.toLocaleString()}억`;
+  return amount.toLocaleString("ko-KR");
 }
 
 function clubValueChangeLabel(amount: bigint) {
@@ -192,7 +244,11 @@ function squadPriceLabel(value: string | null) {
 }
 
 function historyClubValueLabel(value: number) {
-  return clubValueLabel(String(BigInt(Math.round(value)) * 1_000_000_000_000n));
+  return clubValueLabel(String(BigInt(Math.round(value * 10)) * 10_000_000n));
+}
+
+function historyClubValuePoint(value: string) {
+  return Number(BigInt(value) / 10_000_000n) / 10;
 }
 
 function RankingDelta({ direction, label, unavailable = false }: {
@@ -209,7 +265,7 @@ function RankingDelta({ direction, label, unavailable = false }: {
 function RankDelta({ current, previous }: { current: number; previous: number | null }) {
   if (previous == null) return <RankingDelta direction="same" label="" unavailable />;
   const difference = previous - current;
-  return <RankingDelta direction={difference > 0 ? "up" : difference < 0 ? "down" : "same"} label={`${Math.abs(difference).toLocaleString()}위`} />;
+  return <RankingDelta direction={difference > 0 ? "up" : difference < 0 ? "down" : "same"} label={Math.abs(difference).toLocaleString()} />;
 }
 
 function ClubValueDelta({ current, previous }: { current: string | null; previous: string | null }) {
@@ -228,7 +284,7 @@ function rankHistoryChange(first: HistoryItem, last: HistoryItem): HistoryChange
   const difference = first.rank - last.rank;
   if (difference > 0) return { label: `${difference.toLocaleString()}등 상승`, trend: "up" };
   if (difference < 0) return { label: `${Math.abs(difference).toLocaleString()}등 하락`, trend: "down" };
-  return { label: "순위 변동 없음", trend: "same" };
+  return { label: "랭킹 변동 없음", trend: "same" };
 }
 
 function clubValueHistoryChange(first: HistoryItem, last: HistoryItem): HistoryChange {
@@ -262,8 +318,7 @@ function TeamAutocomplete({ id, label, value, options, onChange, onSelect, clear
   const [open, setOpen] = useState(false);
   const normalized = value.trim().toLocaleLowerCase("ko-KR");
   const matches = options
-    .filter((option) => !normalized || option.toLocaleLowerCase("ko-KR").startsWith(normalized))
-    .slice(0, 12);
+    .filter((option) => !normalized || option.toLocaleLowerCase("ko-KR").startsWith(normalized));
   return (
     <div className={`autocomplete-field ${clearable && value ? "has-clear" : ""}`}>
       <label htmlFor={id}>{label}</label>
@@ -337,8 +392,12 @@ function SeasonBadge({ season, image }: { season: string | null; image: string |
   );
 }
 
+function enhancementStyle(grade: number) {
+  return grade <= 1 ? "gray" : grade <= 4 ? "copper" : grade <= 7 ? "silver" : grade <= 10 ? "gold" : "platinum";
+}
+
 function EnhancementBadge({ grade }: { grade: number }) {
-  const style = grade <= 1 ? "gray" : grade <= 4 ? "copper" : grade <= 7 ? "silver" : grade <= 10 ? "gold" : "platinum";
+  const style = enhancementStyle(grade);
   return <span className={`enhancement-badge enhancement-${style} player-meta-badge`} aria-label={`${grade}카`} data-tooltip={`${grade}카`} title={`${grade}카`} tabIndex={0}>+{grade}</span>;
 }
 
@@ -463,18 +522,29 @@ function FormationPitch({ details, fallbackFormation }: { details: SquadProfileD
 
 function SquadSupportDetails({ details }: { details: SquadProfileDetails }) {
   const [hoveredTeamColor, setHoveredTeamColor] = useState<string | null>(null);
+  const [coachImageFailed, setCoachImageFailed] = useState(false);
+  const [defaultCoachImageFailed, setDefaultCoachImageFailed] = useState(false);
+  const defaultCoachImage = "https://ssl.nexon.com/s2/game/fc/mobile/squadMaker/default/d_coach.png";
+  useEffect(() => {
+    setCoachImageFailed(false);
+    setDefaultCoachImageFailed(false);
+  }, [details.coach?.image]);
   return <div className="squad-support-details">
     <section className="squad-coach-card">
-      <div className="squad-detail-heading"><span>MANAGER</span><h4>감독</h4></div>
+      <div className="squad-detail-heading"><h4>감독</h4></div>
       {details.coach ? <div className="coach-content">
-        {details.coach.image ? <img src={details.coach.image} alt={`${details.coach.name} 감독`} /> : <span className="coach-image-missing">이미지 없음</span>}
+        {!defaultCoachImageFailed ? <img
+          src={details.coach.image && !coachImageFailed ? details.coach.image : defaultCoachImage}
+          alt={`${details.coach.name} 감독`}
+          onError={() => details.coach?.image && !coachImageFailed ? setCoachImageFailed(true) : setDefaultCoachImageFailed(true)}
+        /> : <span className="coach-image-missing">감독 이미지</span>}
         <div><h5>{details.coach.name}</h5>{details.coach.description && <p>{details.coach.description}</p>}
-          <dl><div><dt>효과</dt><dd>{details.coach.abilities.length ? details.coach.abilities.join(" · ") : "효과 정보 없음"}</dd></div><div><dt>선호 포메이션</dt><dd>{details.coach.formations.length ? details.coach.formations.join(" · ") : "정보 없음"}</dd></div></dl>
+          <dl><div><dt>효과</dt><dd>{details.coach.abilities.length ? details.coach.abilities.join(" · ") : "효과 정보 없음"}</dd></div><div><dt>선호 포메이션</dt><dd>{details.coach.formations.length ? details.coach.formations.join(" | ") : "정보 없음"}</dd></div></dl>
         </div>
       </div> : <p className="squad-detail-empty">등록된 감독 정보가 없습니다.</p>}
     </section>
     <section className="squad-team-colors">
-      <div className="squad-detail-heading"><span>ACTIVE TEAM COLORS</span><h4>적용 팀컬러</h4></div>
+      <div className="squad-detail-heading"><h4>적용 팀컬러</h4></div>
       {details.teamColors.length ? <div className="team-color-detail-list">{details.teamColors.map((color) => {
         const colorKey = `${color.category}-${color.id}-${color.name}`;
         const playerSpids = new Set(color.playerSpids.map(String));
@@ -544,7 +614,7 @@ function SquadSection({ nickname, formation, squad, emptyClassName = "profile-em
   };
 
   return <>
-    <div className="profile-block-heading"><div><span>CURRENT SQUAD</span><h3>현재 선발 스쿼드</h3><small className="squad-adaptation-note">모든 선수는 적응도 5로 표시됩니다.</small></div><div className="squad-heading-tools"><b>{details?.players.length ?? squad.length}명</b><CompactSwitch label="포메이션 배치" checked={formationView} disabled={loading || !details?.players.length} onChange={toggleFormationView} /></div></div>
+    <div className="profile-block-heading"><div><h3>현재 선발 스쿼드</h3><small className="squad-adaptation-note">모든 선수는 적응도 5로 표시됩니다.</small></div><div className="squad-heading-tools"><b>{details?.players.length ?? squad.length}명</b><CompactSwitch label="포메이션 배치" checked={formationView} disabled={loading || !details?.players.length} onChange={toggleFormationView} /></div></div>
     {formationView && details ? <FormationPitch details={details} fallbackFormation={formation} /> : detailedSquad.length > 0 ? <>
       <div className="squad-list-formation"><span>FORMATION</span><b>{details?.formation || formation || "포메이션 정보 없음"}</b></div>
       <div className="squad-grid squad-grid-detailed">{detailedSquad.map((player) => (
@@ -562,7 +632,7 @@ function SquadSection({ nickname, formation, squad, emptyClassName = "profile-em
   </>;
 }
 
-function HistoryChart({ title, items, value, format, formatPoint, frame, change, lowerIsHigher = false }: {
+function HistoryChart({ title, items, value, format, formatPoint, frame, change, lowerIsHigher = false, visibleScale = false, scalePaddingRatio = 0.18, minimumScalePadding = 0 }: {
   title: string;
   items: HistoryItem[];
   value: (item: HistoryItem) => number | null;
@@ -571,25 +641,52 @@ function HistoryChart({ title, items, value, format, formatPoint, frame, change,
   frame: HistoryFrame;
   change: (first: HistoryItem, last: HistoryItem) => HistoryChange;
   lowerIsHigher?: boolean;
+  visibleScale?: boolean;
+  scalePaddingRatio?: number;
+  minimumScalePadding?: number;
 }) {
   const [activeIndex, setActiveIndex] = useState<number | null>(null);
+  const [visibleWindow, setVisibleWindow] = useState({ left: 0, width: 0 });
   const scrollRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef({ active: false, moved: false, startX: 0, startLeft: 0 });
   const chartItems = items.map((item) => ({ item, point: value(item) }))
     .filter((entry): entry is { item: HistoryItem; point: number } => entry.point != null && Number.isFinite(entry.point));
   const points = chartItems.map((entry) => entry.point);
+  const syncVisibleWindow = (scroller: HTMLDivElement) => {
+    const next = { left: scroller.scrollLeft, width: scroller.clientWidth };
+    setVisibleWindow((current) => current.left === next.left && current.width === next.width ? current : next);
+  };
   useEffect(() => {
     const scroller = scrollRef.current;
-    if (scroller) scroller.scrollLeft = scroller.scrollWidth;
+    if (!scroller) return;
+    scroller.scrollLeft = scroller.scrollWidth;
+    syncVisibleWindow(scroller);
+    const resizeObserver = new ResizeObserver(() => syncVisibleWindow(scroller));
+    resizeObserver.observe(scroller);
+    return () => resizeObserver.disconnect();
   }, [items, frame]);
   if (points.length < 2) return <div className="history-chart empty"><h4>{title}</h4><p>변화를 보여줄 기록이 아직 부족합니다.</p></div>;
   const min = Math.min(...points);
   const max = Math.max(...points);
-  const plotWidth = Math.max(300, 16 + (points.length - 1) * 56);
+  const plotHeight = 140;
+  const pointSpacing = 56;
+  const plotWidth = Math.max(300, 16 + (points.length - 1) * pointSpacing);
+  const viewportLeft = visibleWindow.width > 0 ? visibleWindow.left : Math.max(0, plotWidth - 320);
+  const viewportWidth = visibleWindow.width > 0 ? visibleWindow.width : Math.min(320, plotWidth);
+  const visibleStart = Math.max(0, Math.min(points.length - 1, Math.ceil((viewportLeft - 8) / pointSpacing)));
+  const visibleEnd = Math.max(visibleStart, Math.min(points.length - 1, Math.floor((viewportLeft + viewportWidth - 8) / pointSpacing)));
+  const visiblePoints = visibleScale ? points.slice(visibleStart, visibleEnd + 1) : points;
+  const visibleMin = Math.min(...visiblePoints);
+  const visibleMax = Math.max(...visiblePoints);
+  const visibleRange = visibleMax - visibleMin;
+  const scalePadding = Math.max(minimumScalePadding, visibleRange * scalePaddingRatio);
+  const scaleMin = visibleScale ? visibleMin - scalePadding : min;
+  const scaleMax = visibleScale ? visibleMax + scalePadding : max;
   const coordinates = chartItems.map(({ point }, index) => {
     const x = 8 + (index / Math.max(points.length - 1, 1)) * (plotWidth - 16);
-    const ratio = (point - min) / (max - min);
-    const y = max === min ? 70 : lowerIsHigher ? 20 + ratio * 110 : 130 - ratio * 110;
+    const ratio = scaleMax === scaleMin ? 0.5 : (point - scaleMin) / (scaleMax - scaleMin);
+    const clampedRatio = Math.max(0, Math.min(1, ratio));
+    const y = scaleMax === scaleMin ? 70 : lowerIsHigher ? 20 + clampedRatio * 110 : 130 - clampedRatio * 110;
     return { x, y };
   });
   const active = activeIndex == null ? null : chartItems[activeIndex];
@@ -620,6 +717,7 @@ function HistoryChart({ title, items, value, format, formatPoint, frame, change,
       }}
       onPointerUp={(event) => finishDrag(event.currentTarget, event.pointerId)}
       onPointerCancel={(event) => finishDrag(event.currentTarget, event.pointerId)}
+      onScroll={(event) => syncVisibleWindow(event.currentTarget)}
       onWheel={(event) => {
         event.preventDefault();
         event.currentTarget.scrollLeft += Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
@@ -629,17 +727,17 @@ function HistoryChart({ title, items, value, format, formatPoint, frame, change,
       aria-label={`${title} 이전 기록 탐색`}
       tabIndex={0}
     >
-      <div className="history-chart-plot" onMouseLeave={() => setActiveIndex(null)} style={{ width: `${plotWidth}px` }}>
-        <svg viewBox={`0 0 ${plotWidth} 140`} role="img" aria-label={`${title} 변화`} style={{ width: `${plotWidth}px` }}>
+      <div className="history-chart-plot" onMouseLeave={() => setActiveIndex(null)} style={{ width: `${plotWidth}px`, height: `${plotHeight + 20}px` }}>
+        <svg viewBox={`0 0 ${plotWidth} ${plotHeight}`} role="img" aria-label={`${title} 변화`} style={{ width: `${plotWidth}px`, height: `${plotHeight}px` }}>
           <polyline points={line} fill="none" stroke="currentColor" strokeWidth="3" vectorEffect="non-scaling-stroke" />
           {coordinates.map(({ x, y }, index) => {
             const label = `${historyTooltipLabel(chartItems[index].item.dataTime)}, ${format(chartItems[index].item)}`;
-            return <circle
+            return <g key={`${chartItems[index].item.dataTime}-${index}`}>
+              <circle
               className={activeIndex === index ? "active" : ""}
               cx={x}
               cy={y}
               fill="currentColor"
-              key={`${chartItems[index].item.dataTime}-${index}`}
               onBlur={() => setActiveIndex(null)}
               onClick={() => { if (!dragRef.current.moved) setActiveIndex(index); }}
               onFocus={() => setActiveIndex(index)}
@@ -648,14 +746,15 @@ function HistoryChart({ title, items, value, format, formatPoint, frame, change,
               role="button"
               tabIndex={0}
               aria-label={label}
-            />;
+              />
+            </g>;
           })}
         </svg>
         {active && activeCoordinate && <div
           className={`history-chart-tooltip ${activeCoordinate.y < 60 ? "below" : ""}`}
           style={{
             left: `${Math.min(plotWidth - 72, Math.max(72, activeCoordinate.x))}px`,
-            top: `${(activeCoordinate.y / 140) * 100}%`,
+            top: `${(activeCoordinate.y / plotHeight) * 100}%`,
           }}
         ><span>{historyTooltipLabel(active.item.dataTime)}</span><b>{format(active.item)}</b></div>}
       </div>
@@ -669,13 +768,431 @@ function HistoryChart({ title, items, value, format, formatPoint, frame, change,
   </div>;
 }
 
-export default function Home() {
+const adsenseClient = "ca-pub-1436343908093854";
+const responsiveAdSlot = "9658268635";
+
+function ResponsiveAd({ label }: { label: string }) {
+  const adRef = useRef<HTMLElement>(null);
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+
+  useEffect(() => {
+    const ad = adRef.current;
+    if (!ad || ad.dataset.adRequested === "true") return;
+
+    ad.dataset.adRequested = "true";
+    try {
+      const adsenseWindow = window as typeof window & { adsbygoogle?: unknown[] };
+      adsenseWindow.adsbygoogle = adsenseWindow.adsbygoogle || [];
+      adsenseWindow.adsbygoogle.push({});
+    } catch {
+      delete ad.dataset.adRequested;
+    }
+  }, [mounted]);
+
+  return (
+    <aside className="responsive-ad" aria-label={label}>
+      {mounted && <ins
+        ref={adRef}
+        className="adsbygoogle"
+        data-ad-client={adsenseClient}
+        data-ad-slot={responsiveAdSlot}
+        data-ad-format="auto"
+        data-full-width-responsive="true"
+      />}
+    </aside>
+  );
+}
+
+export function PlayerMarketChart({ market, marketRef }: { market: PlayerDetail["market"]; marketRef?: RefObject<HTMLElement | null> }) {
+  const [activePoint, setActivePoint] = useState<number | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const dragRef = useRef({ active: false, moved: false, startX: 0, startLeft: 0 });
+  const history = (market?.history || []).slice(-30);
+  const values = history.map((item) => Number(item.price));
+  const exactValues = history.map((item) => BigInt(item.price));
+  const minimum = values.length ? Math.min(...values) : 0;
+  const maximum = values.length ? Math.max(...values) : 0;
+  const exactMinimum = exactValues.length ? exactValues.reduce((lowest, value) => value < lowest ? value : lowest) : 0n;
+  const exactMaximum = exactValues.length ? exactValues.reduce((highest, value) => value > highest ? value : highest) : 0n;
+  const range = Math.max(1, maximum - minimum);
+  const plotHeight = 168;
+  const pointSpacing = 28;
+  const plotWidth = Math.max(640, 40 + Math.max(0, history.length - 1) * pointSpacing);
+  const chartPoints = history.map((item, index) => {
+    const x = history.length < 2 ? plotWidth / 2 : 20 + (index / (history.length - 1)) * (plotWidth - 40);
+    const y = 14 + (1 - (Number(item.price) - minimum) / range) * 110;
+    return { x, y, value: `${x.toFixed(2)},${y.toFixed(2)}` };
+  });
+  const points = chartPoints.map((point) => point.value).join(" ");
+  const selectedPoint = activePoint === null ? null : chartPoints[activePoint];
+  const selectedHistory = activePoint === null ? null : history[activePoint];
+  const finishDrag = (element: HTMLDivElement, pointerId: number) => {
+    dragRef.current.active = false;
+    if (element.hasPointerCapture(pointerId)) element.releasePointerCapture(pointerId);
+  };
+
+  useEffect(() => {
+    const scroller = scrollRef.current;
+    if (scroller) scroller.scrollLeft = scroller.scrollWidth;
+  }, [history.length, market?.currentPrice]);
+
+  return <section ref={marketRef} className="player-detail-market">
+    <header><h4>시세</h4><p>현재가 <b>{market?.currentPrice ? `${squadPriceLabel(market.currentPrice)} BP` : "정보 없음"}</b></p></header>
+    {history.length ? <>
+      <div className="player-detail-market-range"><span>최고가 {squadPriceLabel(exactMaximum.toString())} BP</span><span>최저가 {squadPriceLabel(exactMinimum.toString())} BP</span></div>
+      <div className="player-detail-market-scroll"
+        ref={scrollRef}
+        onPointerDown={(event) => {
+          if (event.button !== 0) return;
+          dragRef.current = { active: true, moved: false, startX: event.clientX, startLeft: event.currentTarget.scrollLeft };
+          event.currentTarget.setPointerCapture(event.pointerId);
+        }}
+        onPointerMove={(event) => {
+          if (!dragRef.current.active) return;
+          const distance = event.clientX - dragRef.current.startX;
+          if (Math.abs(distance) > 3) dragRef.current.moved = true;
+          event.currentTarget.scrollLeft = dragRef.current.startLeft - distance;
+        }}
+        onPointerUp={(event) => finishDrag(event.currentTarget, event.pointerId)}
+        onPointerCancel={(event) => finishDrag(event.currentTarget, event.pointerId)}
+        onWheel={(event) => {
+          event.preventDefault();
+          event.currentTarget.scrollLeft += Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+        }}
+        role="region"
+        aria-label="시세 기록 탐색"
+        tabIndex={0}
+      >
+        <div className="player-detail-market-chart" style={{ width: `${plotWidth}px`, height: `${plotHeight}px` }}>
+          <svg viewBox={`0 0 ${plotWidth} ${plotHeight}`} role="img" aria-label="최근 30개 시세 기록">
+            <line x1="20" y1="14" x2={plotWidth - 20} y2="14" /><line x1="20" y1="69" x2={plotWidth - 20} y2="69" /><line x1="20" y1="124" x2={plotWidth - 20} y2="124" />
+            <polygon className="player-detail-market-area" points={`20,124 ${points} ${plotWidth - 20},124`} />
+            <polyline points={points} />
+            {chartPoints.map((point, index) => <g
+              className={activePoint === index ? "active" : undefined}
+              key={`${history[index].date}-${index}`}
+              onBlur={() => setActivePoint(null)}
+              onFocus={() => setActivePoint(index)}
+              onMouseEnter={() => { if (!dragRef.current.active) setActivePoint(index); }}
+              onMouseLeave={() => setActivePoint(null)}
+              onPointerDown={() => { if (!dragRef.current.moved) setActivePoint(index); }}
+              role="button"
+              tabIndex={0}
+              aria-label={`${history[index].date} ${squadPriceLabel(history[index].price)} BP`}
+            ><circle className="player-detail-market-hit" cx={point.x} cy={point.y} r="10" /><circle cx={point.x} cy={point.y} r="4" /></g>)}
+            <g aria-hidden="true">{chartPoints.map((point, index) => <text className="player-detail-market-date-label" key={`${history[index].date}-${index}-label`} x={point.x} y="151" textAnchor="end" transform={`rotate(-55 ${point.x} 151)`}>{history[index].date}</text>)}</g>
+          </svg>
+          {selectedPoint && selectedHistory && <output className={`player-detail-market-tooltip${selectedPoint.y < 54 ? " is-below-point" : ""}`} style={{ left: `${(selectedPoint.x / plotWidth) * 100}%`, top: `${(selectedPoint.y / plotHeight) * 100}%` }}>
+            <small>{selectedHistory.date}</small><b>{squadPriceLabel(selectedHistory.price)} BP</b>
+          </output>}
+        </div>
+      </div>
+    </> : <p className="player-detail-data-empty">제공된 시세 기록이 없습니다.</p>}
+  </section>;
+}
+
+function PlayerDetailPanel({ player, controls }: { player: PlayerDetail; controls?: ReactNode }) {
+  const [activeTrait, setActiveTrait] = useState<string | null>(null);
+  const marketRef = useRef<HTMLElement | null>(null);
+  const [marketHeight, setMarketHeight] = useState<number | null>(null);
+  const filledSkillMoves = player.skillMoves?.match(/★/g)?.length ?? 0;
+  const emptySkillMoves = player.skillMoves?.match(/☆/g)?.length ?? 0;
+  const totalSkillMoves = filledSkillMoves + emptySkillMoves;
+  const footStrongIndex = player.footStrong && player.foot ? player.foot.indexOf(player.footStrong) : -1;
+
+  useEffect(() => {
+    const market = marketRef.current;
+    if (!market) return;
+    const updateHeight = () => setMarketHeight(Math.ceil(market.getBoundingClientRect().height));
+    const observer = new ResizeObserver(updateHeight);
+    observer.observe(market);
+    updateHeight();
+    return () => observer.disconnect();
+  }, [player.market]);
+
+  const supplementStyle = marketHeight ? { "--player-detail-market-height": `${marketHeight}px` } as CSSProperties : undefined;
+
+  return <article className="player-detail-panel">
+    <div className="player-detail-hero">
+      <div className="player-detail-image">
+        {player.image ? <img src={player.image} alt={`${player.name} 선수`} /> : <span>NO IMAGE</span>}
+      </div>
+      <div className="player-detail-heading">
+        <div>{player.seasonImage && <img src={player.seasonImage} alt="" />}<EnhancementBadge grade={player.grade} /></div>
+        <h3>{player.name}</h3>
+        <p>{player.season || "시즌 정보 없음"}</p>
+        <div className="player-detail-key-values">
+          <span><small>OVR</small><b>{player.ovr ?? "—"}</b></span>
+          <span><small>급여</small><b>{player.pay ?? "—"}</b></span>
+        </div>
+      </div>
+    </div>
+    {controls}
+    <div className="player-detail-positions">
+      {player.positions.length ? player.positions.map((item) => <span key={item.position}><small>{item.position}</small><b>{item.value}</b></span>) : <p>포지션 정보가 없습니다.</p>}
+    </div>
+    <dl className="player-detail-basics">
+      <div><dt>국가</dt><dd>{player.nationImage && <img src={player.nationImage} alt="" />}{player.nation || "정보 없음"}</dd></div>
+      <div><dt>신체</dt><dd>{[player.height, player.weight].filter(Boolean).join(" · ") || "정보 없음"}</dd></div>
+      <div><dt>체형</dt><dd>{player.bodyType || "정보 없음"}</dd></div>
+      <div><dt>주발</dt><dd>{player.foot ? <span className="foot-label">{footStrongIndex >= 0 ? <>{player.foot.slice(0, footStrongIndex)}<strong>{player.footStrong}</strong>{player.foot.slice(footStrongIndex + player.footStrong!.length)}</> : player.foot}</span> : "정보 없음"}</dd></div>
+      <div><dt>개인기</dt><dd>{totalSkillMoves ? <span className="skill-moves-rating" aria-label={`${filledSkillMoves}/${totalSkillMoves}`}>
+        {Array.from({ length: totalSkillMoves }, (_, index) => <span key={index} className={index < filledSkillMoves ? "filled" : "empty"}>★</span>)}
+      </span> : "정보 없음"}</dd></div>
+      <div><dt>생년월일</dt><dd>{player.birthDate || "정보 없음"}</dd></div>
+    </dl>
+    <div className="player-detail-traits">
+      <h4>특성</h4>
+      <div>{player.traits.length ? player.traits.map((trait) => <button
+        key={`${trait.name}-${trait.image}`}
+        type="button"
+        className={activeTrait === trait.name ? "active" : undefined}
+        aria-label={trait.name}
+        aria-expanded={activeTrait === trait.name}
+        onClick={() => setActiveTrait((current) => current === trait.name ? null : trait.name)}
+        onBlur={() => setActiveTrait(null)}
+      >
+        <img src={trait.image} alt="" />
+        <span role="tooltip">{trait.name}</span>
+      </button>) : <p>제공된 특성이 없습니다.</p>}</div>
+    </div>
+    <div className="player-detail-abilities">
+      <h4>세부 능력치</h4>
+      <div>{player.abilities.length ? player.abilities.map((ability) => <span key={ability.name}><small>{ability.name}</small><b className={ability.value >= 40 ? `ability-over-${Math.min(150, Math.floor(ability.value / 10) * 10)}` : undefined}>{ability.value}</b></span>) : <p>제공된 능력치가 없습니다.</p>}</div>
+    </div>
+    <div className="player-detail-supplement" style={supplementStyle}>
+      <section className="player-detail-career">
+        <header><h4>클럽 경력</h4></header>
+        {player.career?.length ? <div className="player-detail-career-list">
+          <div className="player-detail-career-head"><span>연도</span><span>클럽</span><span>임대 여부</span></div>
+          {player.career.map((item, index) => <div key={`${item.year}-${item.club}-${index}`}><span>{item.year}</span><b>{item.club}</b><span>{item.loan || "—"}</span></div>)}
+        </div> : <p className="player-detail-data-empty">제공된 클럽 경력이 없습니다.</p>}
+      </section>
+      <PlayerMarketChart market={player.market} marketRef={marketRef} />
+    </div>
+  </article>;
+}
+
+export function PlayerComparePanel({ left, right, onClose, onGradeChange, showClose = true }: { left: PlayerDetail; right: PlayerDetail; onClose?: () => void; onGradeChange?: (player: PlayerDetail, grade: number) => void; showClose?: boolean }) {
+  const [activeCompareTrait, setActiveCompareTrait] = useState<string | null>(null);
+  const displayFoot = (player: PlayerDetail) => {
+    if (!player.foot) return "정보 없음";
+    const strongIndex = player.footStrong ? player.foot.indexOf(player.footStrong) : -1;
+    return <span className="foot-label">{strongIndex >= 0 ? <>{player.foot.slice(0, strongIndex)}<strong>{player.footStrong}</strong>{player.foot.slice(strongIndex + player.footStrong!.length)}</> : player.foot}</span>;
+  };
+  const displaySkillMoves = (player: PlayerDetail) => {
+    const filled = player.skillMoves?.match(/★/g)?.length ?? 0;
+    const total = player.skillMoves?.match(/[★☆]/g)?.length ?? 0;
+    return total ? <span className="skill-moves-rating" aria-label={`${filled}/${total}`}>{Array.from({ length: total }, (_, index) => <span key={index} className={index < filled ? "filled" : "empty"}>★</span>)}</span> : "정보 없음";
+  };
+  const abilityClass = (value: number | undefined) => value !== undefined && value >= 40 ? `ability-over-${Math.min(150, Math.floor(value / 10) * 10)}` : undefined;
+  const abilityNames = Array.from(new Set([...left.abilities.map((ability) => ability.name), ...right.abilities.map((ability) => ability.name)]));
+  const leftAbilities = new Map(left.abilities.map((ability) => [ability.name, ability.value]));
+  const rightAbilities = new Map(right.abilities.map((ability) => [ability.name, ability.value]));
+  const basicRows = [
+    [left.name, "선수", right.name],
+    [left.seasonImage ? <img className="player-compare-season-image" src={left.seasonImage} alt={left.season || "시즌 정보 없음"} /> : left.season || "시즌 정보 없음", "시즌", right.seasonImage ? <img className="player-compare-season-image" src={right.seasonImage} alt={right.season || "시즌 정보 없음"} /> : right.season || "시즌 정보 없음"],
+    [left.ovr ?? "—", "OVR", right.ovr ?? "—"],
+    [left.pay ?? "—", "급여", right.pay ?? "—"],
+    [left.market?.currentPrice ? `${squadPriceLabel(left.market.currentPrice)} BP` : "정보 없음", "현재가", right.market?.currentPrice ? `${squadPriceLabel(right.market.currentPrice)} BP` : "정보 없음"],
+    [left.nation || "정보 없음", "국가", right.nation || "정보 없음"],
+    [[left.height, left.weight].filter(Boolean).join(" · ") || "정보 없음", "신체", [right.height, right.weight].filter(Boolean).join(" · ") || "정보 없음"],
+    [left.bodyType || "정보 없음", "체형", right.bodyType || "정보 없음"],
+    [displayFoot(left), "주발", displayFoot(right)],
+    [displaySkillMoves(left), "개인기", displaySkillMoves(right)],
+    [left.birthDate || "정보 없음", "생년월일", right.birthDate || "정보 없음"]
+  ] as const;
+
+  const ComparisonRows = ({ children }: { children: ReactNode }) => <div className="player-compare-rows">{children}</div>;
+  const ComparisonRow = ({ leftValue, label, rightValue, ability = false, className, leftClass, rightClass, leftDelta, rightDelta }: { leftValue: ReactNode; label: string; rightValue: ReactNode; ability?: boolean; className?: string; leftClass?: string; rightClass?: string; leftDelta?: number; rightDelta?: number }) => <div className={`player-compare-row${ability ? " ability" : ""}${className ? ` ${className}` : ""}`}>
+    <b className={leftClass}>{leftDelta !== undefined && <small>+{leftDelta}</small>}{leftValue}</b><span>{label}</span><b className={rightClass}>{rightValue}{rightDelta !== undefined && <small>+{rightDelta}</small>}</b>
+  </div>;
+  const ComparisonCareer = ({ player }: { player: PlayerDetail }) => <section className="player-compare-supplement">
+    <section className="player-detail-career">
+      {player.career?.length ? <div className="player-detail-career-list">
+        <div className="player-detail-career-head"><span>연도</span><span>클럽</span><span>임대 여부</span></div>
+        {player.career.map((item, index) => <div key={`${item.year}-${item.club}-${index}`}><span>{item.year}</span><b>{item.club}</b><span>{item.loan || "—"}</span></div>)}
+      </div> : <p className="player-detail-data-empty">제공된 클럽 경력이 없습니다.</p>}
+    </section>
+  </section>;
+  const ComparisonMarket = ({ player }: { player: PlayerDetail }) => <section className="player-compare-supplement">
+    <PlayerMarketChart market={player.market} />
+  </section>;
+
+  return <article className="player-compare-panel">
+    <div className="player-compare-players">
+      {[left, right].map((player, index) => <div key={`${player.spid}-${player.grade}`} className={`player-compare-player player-${index === 0 ? "a" : "b"}`}>
+        <div className="player-compare-image">{player.image ? <img src={player.image} alt={`${player.name} 선수`} draggable={false} /> : <span>NO IMAGE</span>}</div>
+        <div className="player-compare-summary">
+          <div className="player-compare-identity">
+            <strong>{player.name}</strong>
+          </div>
+          <div className="player-compare-badges">
+            {player.seasonImage ? <img src={player.seasonImage} alt={player.season || "시즌 정보 없음"} /> : null}
+            {player.nationImage ? <img src={player.nationImage} alt={player.nation || "국가 정보 없음"} /> : null}
+          </div>
+          <div className="player-compare-position-summary">
+            {player.positions.slice(0, 3).map((item) => <span key={item.position}><small>{item.position}</small><b>{item.value}</b></span>)}
+          </div>
+          <p>{[player.birthDate, [player.height, player.weight].filter(Boolean).join(" / ")].filter(Boolean).join(" · ")}</p>
+          <p>
+            {player.bodyType ? <>{player.bodyType} · </> : null}
+            {displayFoot(player)}
+          </p>
+        </div>
+      </div>)}
+      <span className="player-compare-vs" aria-hidden="true">VS</span>
+      {showClose && onClose ? <button aria-label="선수 비교 닫기" className="player-compare-close" type="button" onClick={onClose}>×</button> : null}
+    </div>
+    <section className="player-compare-section">
+      <h3>선수 정보</h3>
+      <ComparisonRows>
+        {basicRows.slice(0, 2).map(([leftValue, label, rightValue]) => <ComparisonRow key={label} leftValue={leftValue} label={label} rightValue={rightValue} className={label === "시즌" ? "season" : undefined} />)}
+        <ComparisonRow
+          leftValue={onGradeChange ? <select className="player-compare-grade-select" aria-label={`${left.name} 강화 단계`} value={left.grade} onChange={(event) => onGradeChange(left, Number(event.target.value))}>{Array.from({ length: 13 }, (_, index) => <option key={index + 1} value={index + 1}>+{index + 1}</option>)}</select> : `+${left.grade}`}
+          label="강화"
+          rightValue={onGradeChange ? <select className="player-compare-grade-select" aria-label={`${right.name} 강화 단계`} value={right.grade} onChange={(event) => onGradeChange(right, Number(event.target.value))}>{Array.from({ length: 13 }, (_, index) => <option key={index + 1} value={index + 1}>+{index + 1}</option>)}</select> : `+${right.grade}`}
+        />
+        {basicRows.slice(2).map(([leftValue, label, rightValue]) => <ComparisonRow key={label} leftValue={leftValue} label={label} rightValue={rightValue} leftClass={label === "OVR" ? abilityClass(left.ovr) : undefined} rightClass={label === "OVR" ? abilityClass(right.ovr) : undefined} />)}
+      </ComparisonRows>
+    </section>
+    {(left.positions.length > 0 || right.positions.length > 0) && <section className="player-compare-section">
+      <h3>포지션</h3>
+      <div className="player-compare-holdings positions">
+        <div>{left.positions.map((item) => <span key={item.position}><small>{item.position}</small><b>{item.value}</b></span>)}</div>
+        <i aria-hidden="true" />
+        <div>{right.positions.map((item) => <span key={item.position}><small>{item.position}</small><b>{item.value}</b></span>)}</div>
+      </div>
+    </section>}
+    {(left.traits.length > 0 || right.traits.length > 0) && <section className="player-compare-section">
+      <h3>특성</h3>
+      <div className="player-compare-holdings traits">
+        <div>{left.traits.map((trait) => <button
+          key={`${trait.name}-${trait.image}`}
+          type="button"
+          className={activeCompareTrait === `left-${trait.name}` ? "active" : undefined}
+          aria-label={trait.name}
+          aria-expanded={activeCompareTrait === `left-${trait.name}`}
+          onClick={() => setActiveCompareTrait((current) => current === `left-${trait.name}` ? null : `left-${trait.name}`)}
+          onBlur={() => setActiveCompareTrait(null)}
+        ><img src={trait.image} alt="" /><span role="tooltip">{trait.name}</span></button>)}</div>
+        <i aria-hidden="true" />
+        <div>{right.traits.map((trait) => <button
+          key={`${trait.name}-${trait.image}`}
+          type="button"
+          className={activeCompareTrait === `right-${trait.name}` ? "active" : undefined}
+          aria-label={trait.name}
+          aria-expanded={activeCompareTrait === `right-${trait.name}`}
+          onClick={() => setActiveCompareTrait((current) => current === `right-${trait.name}` ? null : `right-${trait.name}`)}
+          onBlur={() => setActiveCompareTrait(null)}
+        ><img src={trait.image} alt="" /><span role="tooltip">{trait.name}</span></button>)}</div>
+      </div>
+    </section>}
+    <section className="player-compare-section">
+      <h3>세부 능력치</h3>
+      <ComparisonRows>{abilityNames.length ? abilityNames.map((ability) => {
+        const leftValue = leftAbilities.get(ability);
+        const rightValue = rightAbilities.get(ability);
+        const difference = leftValue !== undefined && rightValue !== undefined ? Math.abs(leftValue - rightValue) : 0;
+        return <ComparisonRow key={ability} ability leftValue={leftValue ?? "—"} label={ability} rightValue={rightValue ?? "—"} leftClass={abilityClass(leftValue)} rightClass={abilityClass(rightValue)} leftDelta={difference > 0 && leftValue! > rightValue! ? difference : undefined} rightDelta={difference > 0 && rightValue! > leftValue! ? difference : undefined} />;
+      }) : <ComparisonRow leftValue="—" label="능력치" rightValue="—" />}</ComparisonRows>
+    </section>
+    <section className="player-compare-section">
+      <h3>클럽 경력</h3>
+      <div className="player-compare-supplements"><ComparisonCareer player={left} /><ComparisonCareer player={right} /></div>
+    </section>
+    <section className="player-compare-section">
+      <h3>시세</h3>
+      <div className="player-compare-supplements"><ComparisonMarket player={left} /><ComparisonMarket player={right} /></div>
+    </section>
+  </article>;
+}
+
+export type HomeView = "home" | "pick" | "managers" | "ranking" | "players" | "faq";
+
+function InsightSectionIcon({ kind }: { kind: "formation" | "team-color" }) {
+  return <span className="home-insight-section-icon" aria-hidden="true">{kind === "formation" ?
+    <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M12 4v16M3 12h18" /><circle cx="12" cy="12" r="2.5" /></svg> :
+    <svg viewBox="0 0 24 24"><path d="M8 5 10 3h4l2 2 4 2-2 5-2-1v9H8v-9l-2 1-2-5 4-2Z" /></svg>}
+  </span>;
+}
+
+function FormationMiniPitch({ name }: { name: string }) {
+  const lines = name.split("-").map(Number).filter((value) => Number.isFinite(value) && value > 0);
+  return <svg className="home-insight-mini-pitch" aria-label={`${name} 포메이션 배치`} viewBox="0 0 100 72" role="img">
+    <path d="M3 3h94v66H3zM38 3v9h24V3M3 36h94M39 36a11 11 0 0 0 22 0M38 69v-9h24v9" />
+    <circle cx="50" cy="63" r="2.7" />
+    {lines.map((count, lineIndex) => Array.from({ length: count }, (_, playerIndex) =>
+      <circle key={`${lineIndex}-${playerIndex}`} cx={(playerIndex + 1) * 100 / (count + 1)} cy={50 - lineIndex * (38 / Math.max(1, lines.length - 1))} r="2.7" />))}
+  </svg>;
+}
+
+function InsightPreviewPanel({ kind, title, items, href }: {
+  kind: "formation" | "team-color"; title: string; items: HomeInsightItem[]; href: string;
+}) {
+  return <section className={`home-insight-panel is-${kind}`} aria-label={`${title} 랭킹`}>
+    <header>
+      <div className="home-insight-panel-title"><InsightSectionIcon kind={kind} /><div><h2>{title}</h2></div></div>
+      <a className="home-insight-more" href={href}>전체 보기</a>
+    </header>
+    <div className="home-insight-featured-grid">
+      {items.slice(0, 3).map((item, index) => <article className={`home-insight-featured-card rank-${index + 1}`} key={item.name} style={kind === "team-color" && item.image ? { "--team-emblem": `url(${JSON.stringify(item.image)})` } as CSSProperties : undefined}>
+        <div className="home-insight-featured-heading"><span>{index + 1}</span><h3>{item.name}</h3></div>
+        <div className={`home-insight-featured-visual is-${kind}`}>
+          {kind === "formation" ? <FormationMiniPitch name={item.name} /> : item.image ? <img src={item.image} alt={`${item.name} 로고`} loading="lazy" decoding="async" /> : null}
+        </div>
+        <div className="home-insight-featured-meta"><b>{item.count.toLocaleString()}명</b><strong>{item.rate.toFixed(1)}%</strong></div>
+        <div className="home-insight-meter"><i style={{ width: `${Math.max(4, item.rate)}%` }} /></div>
+      </article>)}
+    </div>
+    <div className="home-insight-compact-list">
+      {items.slice(3, 5).map((item, index) => <article className="home-insight-compact-row" key={item.name}>
+        <span className="home-insight-compact-rank">{index + 4}</span>
+        {kind === "team-color" && item.image ? <span className="home-insight-compact-logo"><img src={item.image} alt="" loading="lazy" decoding="async" /></span> : null}
+        <h3>{item.name}</h3>
+        <div className="home-insight-meter"><i style={{ width: `${Math.max(4, item.rate)}%` }} /></div>
+        <b>{item.count.toLocaleString()}명</b><strong>{item.rate.toFixed(1)}%</strong>
+      </article>)}
+    </div>
+  </section>;
+}
+
+function HomeInsights() {
+  const [data, setData] = useState<HomeInsightsResponse | null>(null);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    const controller = new AbortController();
+    fetch(`${apiBaseUrl}/api/home-insights`, { cache: "no-store", signal: controller.signal })
+      .then(async (response) => {
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.message || "랭킹 데이터를 불러오지 못했습니다.");
+        setData(payload);
+      })
+      .catch((requestError) => { if (requestError?.name !== "AbortError") setError(requestError instanceof Error ? requestError.message : "랭킹 데이터를 불러오지 못했습니다."); });
+    return () => controller.abort();
+  }, []);
+
+  if (error) return <section className="home-insights home-insights-state"><p>{error}</p></section>;
+  if (!data) return <section className="home-insights home-insights-state"><p>포메이션과 팀컬러 랭킹을 집계하고 있습니다.</p></section>;
+  return <section className="home-insights" id="meta-preview" aria-label="랭커 메타 랭킹">
+    <InsightPreviewPanel kind="formation" title="포메이션 랭킹" items={data.formations.items} href="/ranking#formations" />
+    <InsightPreviewPanel kind="team-color" title="팀컬러 랭킹" items={data.teamColors.items} href="/ranking#team-colors" />
+  </section>;
+}
+
+export default function Home({ view = "home" }: { view?: HomeView }) {
+  const [activeSection, setActiveSection] = useState("analysis");
   const [rankStart, setRankStart] = useState("1");
   const [rankEnd, setRankEnd] = useState("1000");
   const [team, setTeam] = useState("");
   const [position, setPosition] = useState("ST");
   const [detailedPositions, setDetailedPositions] = useState(false);
-  const [query, setQuery] = useState<Query>({ start: "1", end: "1000", team: "", position: "ST", detailed: false });
+  const [adaptationEnabled, setAdaptationEnabled] = useState(false);
+  const [query, setQuery] = useState<Query>({ start: "1", end: "1000", team: "", position: "ST", detailed: false, adaptation: 0 });
   const [availablePositions, setAvailablePositions] = useState<string[]>([]);
   const [teamColors, setTeamColors] = useState<Array<{ name: string; managers: number }>>([]);
   const [result, setResult] = useState<PickResponse | null>(null);
@@ -683,6 +1200,16 @@ export default function Home() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState("");
   const [hasSearched, setHasSearched] = useState(false);
+  const [comparisonPlayer, setComparisonPlayer] = useState<PickItem | null>(null);
+  const [playerModalMode, setPlayerModalMode] = useState<"detail" | "compare" | null>(null);
+  const [playerModalItems, setPlayerModalItems] = useState<PlayerDetail[]>([]);
+  const [playerModalLoading, setPlayerModalLoading] = useState(false);
+  const [playerModalError, setPlayerModalError] = useState("");
+  const [playerDetailSource, setPlayerDetailSource] = useState<PickItem | null>(null);
+  const [playerDetailGrade, setPlayerDetailGrade] = useState(1);
+  const [playerDetailAdaptation, setPlayerDetailAdaptation] = useState(0);
+  const playerDetailCache = useRef(new Map<string, PlayerDetail>());
+  const playerDetailRequest = useRef(0);
   const [rankingTeam, setRankingTeam] = useState("");
   const [rankingResult, setRankingResult] = useState<RankingResponse | null>(null);
   const [rankingLoading, setRankingLoading] = useState(true);
@@ -691,8 +1218,10 @@ export default function Home() {
   const [rankingNickname, setRankingNickname] = useState("");
   const [rankingSearchActive, setRankingSearchActive] = useState(false);
   const [rankingSearchLabel, setRankingSearchLabel] = useState("");
+  const [rankingCategory, setRankingCategory] = useState<"managers" | MetaTab>("managers");
   const [profileNickname, setProfileNickname] = useState("");
   const [profileResult, setProfileResult] = useState<UserProfileResponse | null>(null);
+  const [liveProfileResult, setLiveProfileResult] = useState<LiveUserResponse | null>(null);
   const [profileLoading, setProfileLoading] = useState(false);
   const [profileError, setProfileError] = useState("");
   const [historyFrame, setHistoryFrame] = useState<HistoryFrame>("hour");
@@ -708,13 +1237,159 @@ export default function Home() {
   const [modalLoading, setModalLoading] = useState(false);
   const [modalError, setModalError] = useState("");
   const [modalHistoryFrame, setModalHistoryFrame] = useState<HistoryFrame>("hour");
+  const [showScrollTop, setShowScrollTop] = useState(false);
   const modalRequest = useRef(0);
   const modalScrollPosition = useRef(0);
   const teamColorNames = teamColors.map((color) => color.name).sort((a, b) => a.localeCompare(b, "ko-KR"));
 
+  useEffect(() => {
+    const updateScrollTopVisibility = () => setShowScrollTop(window.scrollY > 80);
+    updateScrollTopVisibility();
+    window.addEventListener("scroll", updateScrollTopVisibility, { passive: true });
+    return () => window.removeEventListener("scroll", updateScrollTopVisibility);
+  }, []);
+
+  useEffect(() => {
+    if (view !== "managers") return;
+    const searchedNickname = new URLSearchParams(window.location.search).get("nickname")?.trim() || "";
+    const draftNickname = window.sessionStorage.getItem(managerSearchDraftKey)?.trim() || "";
+    const draftSource = window.sessionStorage.getItem(managerSearchDraftSourceKey)?.trim() || "";
+    setProfileNickname(draftNickname && draftSource === searchedNickname ? draftNickname : searchedNickname || draftNickname);
+    if (searchedNickname) void loadProfile(searchedNickname);
+    // The URL query is the only trigger for the header search handoff.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view]);
+
+  useEffect(() => {
+    if (view !== "ranking") return;
+    const syncRankingCategory = () => {
+      const hash = window.location.hash;
+      setRankingCategory(hash === "#formations" ? "formations" : hash === "#team-colors" ? "team-colors" : "managers");
+    };
+    syncRankingCategory();
+    window.addEventListener("hashchange", syncRankingCategory);
+    return () => window.removeEventListener("hashchange", syncRankingCategory);
+  }, [view]);
+
+  useEffect(() => {
+    if (!playerModalMode) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") closePlayerModal(); };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [playerModalMode]);
+
+  useEffect(() => {
+    const ids = ["analysis", "user-search", "ranking", "community", "support"];
+    function updateActiveSection() {
+      let closestId = ids[0];
+      let closestDistance = Infinity;
+      for (const id of ids) {
+        const element = document.getElementById(id);
+        if (!element) continue;
+        const distance = Math.abs(element.getBoundingClientRect().top);
+        if (distance < closestDistance) {
+          closestDistance = distance;
+          closestId = id;
+        }
+      }
+      setActiveSection(closestId);
+    }
+    updateActiveSection();
+    window.addEventListener("scroll", updateActiveSection, { passive: true });
+    const interval = window.setInterval(updateActiveSection, 250);
+    return () => {
+      window.removeEventListener("scroll", updateActiveSection);
+      window.clearInterval(interval);
+    };
+  }, []);
+
+  async function loadPlayerDetail(player: PickItem, grade = player.grade, adaptation = player.adaptation) {
+    const key = `${player.spid}:${grade}:${adaptation}`;
+    const cached = playerDetailCache.current.get(key);
+    if (cached) return cached;
+    const parameters = new URLSearchParams({ spid: player.spid, grade: String(grade), adaptation: String(adaptation) });
+    const response = await fetch(`${apiBaseUrl}/api/players/details?${parameters}`, { cache: "no-store" });
+    const payload = await response.json();
+    if (!response.ok || !payload.player) throw new Error(payload.message || "선수 정보를 불러오지 못했습니다.");
+    playerDetailCache.current.set(key, payload.player);
+    return payload.player as PlayerDetail;
+  }
+
+  function closePlayerModal() {
+    playerDetailRequest.current += 1;
+    setPlayerModalMode(null);
+    setPlayerModalItems([]);
+    setPlayerModalError("");
+    setPlayerModalLoading(false);
+    setPlayerDetailSource(null);
+    setComparisonPlayer(null);
+  }
+
+  async function requestPlayerDetail(player: PickItem, grade: number, adaptation: number) {
+    const requestId = ++playerDetailRequest.current;
+    setPlayerModalError("");
+    setPlayerModalLoading(true);
+    try {
+      const detail = await loadPlayerDetail(player, grade, adaptation);
+      if (requestId === playerDetailRequest.current) setPlayerModalItems([detail]);
+    } catch (detailError) {
+      if (requestId === playerDetailRequest.current) setPlayerModalError(detailError instanceof Error ? detailError.message : "선수 정보를 불러오지 못했습니다.");
+    } finally {
+      if (requestId === playerDetailRequest.current) setPlayerModalLoading(false);
+    }
+  }
+
+  function openPlayerDetail(player: PickItem) {
+    setPlayerModalMode("detail");
+    setPlayerModalItems([]);
+    setPlayerDetailSource(player);
+    setPlayerDetailGrade(player.grade);
+    setPlayerDetailAdaptation(player.adaptation);
+    void requestPlayerDetail(player, player.grade, player.adaptation);
+  }
+
+  function changePlayerDetailGrade(grade: number) {
+    if (!playerDetailSource) return;
+    setPlayerDetailGrade(grade);
+    void requestPlayerDetail(playerDetailSource, grade, playerDetailAdaptation);
+  }
+
+  function changePlayerDetailAdaptation(adaptation: number) {
+    if (!playerDetailSource) return;
+    setPlayerDetailAdaptation(adaptation);
+    void requestPlayerDetail(playerDetailSource, playerDetailGrade, adaptation);
+  }
+
+  async function togglePlayerComparison(player: PickItem) {
+    if (!comparisonPlayer) {
+      setComparisonPlayer(player);
+      return;
+    }
+    if (comparisonPlayer.spid === player.spid && comparisonPlayer.grade === player.grade) {
+      setComparisonPlayer(null);
+      return;
+    }
+    setPlayerModalMode("compare");
+    setPlayerModalItems([]);
+    setPlayerModalError("");
+    setPlayerModalLoading(true);
+    try {
+      setPlayerModalItems(await Promise.all([loadPlayerDetail(comparisonPlayer), loadPlayerDetail(player)]));
+    } catch (detailError) {
+      setPlayerModalError(detailError instanceof Error ? detailError.message : "선수 비교 정보를 불러오지 못했습니다.");
+    } finally {
+      setPlayerModalLoading(false);
+    }
+  }
+
   function scrollToRankingTop() {
     window.requestAnimationFrame(() => {
-      document.getElementById("ranking")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      document.getElementById("ranking")?.scrollIntoView({ behavior: "auto", block: "start" });
     });
   }
 
@@ -726,8 +1401,8 @@ export default function Home() {
     const parameters = new URLSearchParams({
       rankStart: "1",
       rankEnd: "10000",
-      offset: String((page - 1) * 20),
-      limit: "20",
+      offset: String((page - 1) * rankingPageSize),
+      limit: String(rankingPageSize),
     });
     if (nextTeam) parameters.set("teamColor", nextTeam);
     try {
@@ -748,6 +1423,7 @@ export default function Home() {
   async function searchRanking(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const nickname = rankingNickname.trim();
+    trackAnalytics("search", { nickname, teamColor: rankingTeam }, "ranking_manager");
     if (!nickname) {
       await fetchRankings(rankingTeam, 1, true);
       return;
@@ -795,17 +1471,46 @@ export default function Home() {
     event.preventDefault();
     const nickname = profileNickname.trim();
     if (!nickname) return;
+    const parameters = new URLSearchParams(window.location.search);
+    parameters.set("nickname", nickname);
+    window.history.replaceState(null, "", `${window.location.pathname}?${parameters}`);
+    window.sessionStorage.setItem(managerSearchDraftKey, nickname);
+    window.sessionStorage.setItem(managerSearchDraftSourceKey, nickname);
+    await loadProfile(nickname);
+  }
+
+  function changeProfileNickname(nickname: string) {
+    setProfileNickname(nickname);
+    const activeNickname = new URLSearchParams(window.location.search).get("nickname")?.trim() || "";
+    if (nickname) window.sessionStorage.setItem(managerSearchDraftKey, nickname);
+    else window.sessionStorage.removeItem(managerSearchDraftKey);
+    window.sessionStorage.setItem(managerSearchDraftSourceKey, activeNickname);
+  }
+
+  async function loadProfile(nickname: string) {
+    trackAnalytics("search", { nickname }, "owner_profile");
     setProfileLoading(true);
     setProfileError("");
     setProfileResult(null);
+    setLiveProfileResult(null);
     setMatches([]);
     setSelectedMatch(null);
     try {
       const parameters = new URLSearchParams({ nickname });
-      const response = await fetch(`${apiBaseUrl}/api/users/profile?${parameters}`, { cache: "no-store" });
+      const [response, liveResponse] = await Promise.all([
+        fetch(`${apiBaseUrl}/api/users/profile?${parameters}`, { cache: "no-store" }),
+        fetch(`${apiBaseUrl}/api/users/live-profile?${parameters}`, { cache: "no-store" }).catch(() => null),
+      ]);
       const payload = await response.json();
+      const livePayload = liveResponse ? await liveResponse.json() : null;
+      if (response.status === 404 && payload.code === "USER_NOT_FOUND") {
+        if (!liveResponse?.ok) throw new Error(livePayload?.message || "구단주 정보를 불러오지 못했습니다.");
+        setLiveProfileResult(livePayload);
+        return;
+      }
       if (!response.ok) throw new Error(payload.message || "구단주 정보를 불러오지 못했습니다.");
       setProfileResult(payload);
+      if (liveResponse?.ok) setLiveProfileResult(livePayload);
       if (payload.profile?.hasOuid) void loadRecentMatches(payload.profile.nickname);
     } catch (requestError) {
       setProfileError(requestError instanceof Error ? requestError.message : "구단주 정보를 불러오지 못했습니다.");
@@ -869,6 +1574,7 @@ export default function Home() {
       rankEnd: nextQuery.end,
       position: nextQuery.position,
       detailedPositions: String(nextQuery.detailed),
+      adaptation: String(nextQuery.adaptation),
       offset: String(offset),
       limit: "3",
     });
@@ -986,11 +1692,12 @@ export default function Home() {
     setLoading(true);
     setResult(null);
     setError("");
-    const baseQuery = { start: rankStart, end: rankEnd, team, detailed: detailedPositions };
+    const baseQuery = { start: rankStart, end: rankEnd, team, detailed: detailedPositions, adaptation: adaptationEnabled ? 5 : 0 };
     const available = await fetchAvailablePositions(baseQuery);
     const nextPosition = available.includes(position) ? position : (available[0] || position);
     setPosition(nextPosition);
     const nextQuery = { ...baseQuery, position: nextPosition };
+    trackAnalytics("search", nextQuery, "player_pick_rate");
     setQuery(nextQuery);
     await fetchPicks(nextQuery);
   }
@@ -1002,7 +1709,7 @@ export default function Home() {
 
   function selectPosition(nextPosition: string) {
     setPosition(nextPosition);
-    const nextQuery = { start: rankStart, end: rankEnd, team, position: nextPosition, detailed: detailedPositions };
+    const nextQuery = { start: rankStart, end: rankEnd, team, position: nextPosition, detailed: detailedPositions, adaptation: adaptationEnabled ? 5 : 0 };
     setQuery(nextQuery);
     void fetchPicks(nextQuery);
   }
@@ -1012,7 +1719,7 @@ export default function Home() {
     setDetailedPositions(nextDetailed);
     if (!hasSearched) return;
 
-    const baseQuery = { start: rankStart, end: rankEnd, team, detailed: nextDetailed };
+    const baseQuery = { start: rankStart, end: rankEnd, team, detailed: nextDetailed, adaptation: adaptationEnabled ? 5 : 0 };
     const available = await fetchAvailablePositions(baseQuery);
     const nextPosition = available.includes(position) ? position : (available[0] || position);
     setPosition(nextPosition);
@@ -1021,23 +1728,35 @@ export default function Home() {
     await fetchPicks(nextQuery);
   }
 
+  async function toggleAdaptation() {
+    const nextEnabled = !adaptationEnabled;
+    const nextAdaptation = nextEnabled ? 5 : 0;
+    setAdaptationEnabled(nextEnabled);
+    if (!hasSearched) return;
+    const nextQuery = { ...query, adaptation: nextAdaptation };
+    setQuery(nextQuery);
+    await fetchPicks(nextQuery);
+  }
+
+  function selectRankingCategory(category: "managers" | MetaTab) {
+    setRankingCategory(category);
+    const hash = category === "managers" ? "" : `#${category}`;
+    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}${hash}`);
+  }
+
+  const isHome = view === "home";
+  const showsAnalysis = view === "pick" || view === "players";
+  const showsManagers = view === "managers";
+  const showsRanking = view === "ranking";
+  const showsFaq = view === "faq";
+
   return (
     <main>
-      <header className="site-header">
-        <a className="brand" href="#top" aria-label="FC-SUPPORT 홈">
-          <span className="brand-mark">FC</span><span>SUPPORT</span>
-        </a>
-        <nav aria-label="주요 메뉴">
-          <a className="active" href="#analysis">픽률 분석</a>
-          <a href="#user-search">구단주 검색</a>
-          <a href="#ranking">랭커</a>
-          <a href="#community">커뮤니티</a>
-          <a href="#portfolio">프로젝트</a>
-        </nav>
-        <button className="login-button" type="button" onClick={() => window.dispatchEvent(new Event(openCommunityAuthEvent))}>로그인</button>
-      </header>
+      <SiteHeader active={view === "home" ? null : view} />
 
-      <section className="hero" id="top">
+      {showScrollTop ? <a className="scroll-top-button" href={isHome ? "#top" : "/"} aria-label="맨 위로 이동">↑</a> : null}
+
+      {isHome && <><section className="hero" id="top">
         <div className="hero-copy">
           <p className="eyebrow"><span /> MANAGER MODE INTELLIGENCE</p>
           <h1>감독모드,<br /><em>감이 아니라 데이터로.</em></h1>
@@ -1045,64 +1764,94 @@ export default function Home() {
             상위 10,000명의 실제 선발 스쿼드를 분석해<br className="desktop-break" /> 포지션별 선수 픽률을 가장 빠르게 확인하세요.
           </p>
         </div>
-        <div className="hero-index" aria-hidden="true">
-          <span>01</span><div className="pitch-lines"><i /><i /><i /></div>
-          <strong>10K</strong><small>RANKERS<br />HOURLY</small>
-        </div>
       </section>
 
-      <section className="analysis-shell" id="analysis">
+      <section className="home-quick-links" aria-label="주요 기능 바로가기">
+        <a href="/pick">
+          <span className="home-quick-link-icon"><svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3" /><circle cx="16.5" cy="9" r="2.5" /><path d="M3.5 19v-1.5A4.5 4.5 0 0 1 8 13h2a4.5 4.5 0 0 1 4.5 4.5V19M14 14h2.5a4 4 0 0 1 4 4v1" /></svg></span>
+          <span className="home-quick-link-copy"><b>선수 픽률</b></span>
+          <span className="home-quick-link-arrow" aria-hidden="true">→</span>
+        </a>
+        <a href="/players">
+          <span className="home-quick-link-icon"><svg aria-hidden="true" viewBox="0 0 24 24"><rect x="5" y="3" width="14" height="18" rx="2" /><circle cx="12" cy="9" r="2.5" /><path d="M8 17a4 4 0 0 1 8 0" /></svg></span>
+          <span className="home-quick-link-copy"><b>선수 정보</b></span>
+          <span className="home-quick-link-arrow" aria-hidden="true">→</span>
+        </a>
+        <a href="/managers">
+          <span className="home-quick-link-icon"><svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5" /><path d="m15.5 15.5 4.5 4.5" /></svg></span>
+          <span className="home-quick-link-copy"><b>구단주 검색</b></span>
+          <span className="home-quick-link-arrow" aria-hidden="true">→</span>
+        </a>
+        <a href="/ranking">
+          <span className="home-quick-link-icon"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 19V12M10 19V8M15 19V4M20 19V10" /></svg></span>
+          <span className="home-quick-link-copy"><b>감독모드 랭킹</b></span>
+          <span className="home-quick-link-arrow" aria-hidden="true">→</span>
+        </a>
+        <a href="/community">
+          <span className="home-quick-link-icon"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M20 11a7 7 0 0 1-7 7H8l-4 3 1.2-4.8A7 7 0 1 1 20 11Z" /></svg></span>
+          <span className="home-quick-link-copy"><b>커뮤니티</b></span>
+          <span className="home-quick-link-arrow" aria-hidden="true">→</span>
+        </a>
+      </section>
+
+      <HomeInsights />
+
+      <CommunityPreview />
+
+      <ResponsiveAd label="메인 하단 광고" /></>}
+
+      {showsAnalysis && <><section className={`analysis-shell${hasSearched ? "" : " is-initial"}`} id="analysis">
         <div className="section-heading">
-          <div><p className="section-kicker">PLAYER PICK RATE</p><h2>선수 픽률 조회</h2></div>
+          <div><p className="section-kicker">PLAYER PICK RATE</p><h2>픽률 분석</h2></div>
           <div className={`data-status ${error ? "status-error" : ""}`}>
             <span className="status-dot" /> {!hasSearched ? "조회 전" : loading ? "데이터 확인 중" : snapshotLabel(result?.snapshot.data_time)}
           </div>
         </div>
 
-        <form className="filter-panel" onSubmit={submit}>
-          <fieldset className="rank-fieldset">
-            <legend>랭킹 범위</legend>
-            <label><span>시작 순위</span><input aria-label="시작 순위" inputMode="numeric" min="1" max="10000" type="number" value={rankStart} onChange={(event) => setRankStart(event.target.value)} /><b>위</b></label>
-            <i>—</i>
-            <label><span>끝 순위</span><input aria-label="끝 순위" inputMode="numeric" min="1" max="10000" type="number" value={rankEnd} onChange={(event) => setRankEnd(event.target.value)} /><b>위</b></label>
-          </fieldset>
+        <div className="analysis-panel-group">
+        <aside className="position-panel">
+          <div className="position-adaptation"><CompactSwitch label="적응도" checked={adaptationEnabled} showStateText={false} onChange={() => void toggleAdaptation()} /></div>
+          <div className="position-panel-heading">
+            <CompactSwitch label="상세 포지션" checked={detailedPositions} showStateText={false} onChange={() => void toggleDetailedPositions()} />
+          </div>
+          <div className="position-grid">
+            {!hasSearched ? <p className="position-empty">조회 후 사용할 수 있는 포지션이 표시됩니다.</p> : availablePositions.length > 0 ? availablePositions.map((item) => (
+              <button className={position === item ? "selected" : ""} key={item} onClick={() => selectPosition(item)} type="button">{item}</button>
+            )) : <p className="position-empty">사용 데이터가 있는 포지션이 없습니다.</p>}
+          </div>
+        </aside>
 
-          <div className="select-field">
+        <form className="filter-panel" onSubmit={submit}>
+          <div className="analysis-filter-fields">
+            <div className="analysis-rank-group">
+              <span className="analysis-filter-label">랭킹 범위</span>
+              <div className="analysis-rank-controls">
+                <label><span>시작 랭킹</span><input aria-label="시작 랭킹" inputMode="numeric" min="1" max="10000" type="number" value={rankStart} onChange={(event) => setRankStart(event.target.value)} /><b>위</b></label>
+                <i aria-hidden="true">—</i>
+                <label><span>끝 랭킹</span><input aria-label="끝 랭킹" inputMode="numeric" min="1" max="10000" type="number" value={rankEnd} onChange={(event) => setRankEnd(event.target.value)} /><b>위</b></label>
+              </div>
+            </div>
             <TeamAutocomplete id="pick-team-color" label="팀컬러" value={team} options={teamColorNames} onChange={setTeam} />
           </div>
 
           <button className="search-button" type="submit" disabled={loading}>
-            <span>{loading ? "조회 중" : "픽률 조회"}</span><b aria-hidden="true">↗</b>
+            <span>{loading ? "조회 중" : "픽률 조회"}</span>
           </button>
         </form>
 
         <div className="results-layout">
-          <aside className="position-panel">
-            <div className="position-panel-heading">
-              <p>POSITION</p>
-              <CompactSwitch label="상세 포지션" checked={detailedPositions} showStateText={false} onChange={() => void toggleDetailedPositions()} />
-            </div>
-            <div className="position-grid">
-              {!hasSearched ? <p className="position-empty">조회 후 사용할 수 있는 포지션이 표시됩니다.</p> : availablePositions.length > 0 ? availablePositions.map((item) => (
-                <button className={position === item ? "selected" : ""} key={item} onClick={() => selectPosition(item)} type="button">{item}</button>
-              )) : <p className="position-empty">사용 데이터가 있는 포지션이 없습니다.</p>}
-            </div>
-            <div className="position-note"><span>선발 기준</span>교체 선수와 상대 선수는 집계에서 제외됩니다.</div>
-          </aside>
-
           <div className="result-content">
             {hasSearched && <div className="result-topline">
-              <div><p>{integerLabel(query.start)}–{integerLabel(query.end)}위 · {query.team || "전체 팀"}</p><h3>{query.position} 픽률</h3></div>
               {result && (
                 <div className="result-stats">
-                  <span><b>{result.matchingManagers.toLocaleString()}</b> 감독</span>
-                  <span><b>{result.positionTotal.toLocaleString()}</b> {query.position} 기용</span>
+                  <span>감독 <b>{result.matchingManagers.toLocaleString()}</b>명</span>
+                  <span>{query.position} 기용 <b>{result.positionTotal.toLocaleString()}</b>명</span>
                 </div>
               )}
             </div>}
 
             {!hasSearched ? (
-              <div className="empty-state"><span>NO RESULT</span><h4>검색 결과가 없습니다.</h4><p>순위와 팀컬러를 선택한 뒤 픽률 조회를 눌러주세요.</p></div>
+              <div className="empty-state"><h4>검색 결과가 없습니다.</h4><p>랭킹과 팀컬러를 선택한 뒤 픽률 조회를 눌러주세요.</p></div>
             ) : loading ? (
               <div className="empty-state"><span>LOADING</span><h4>수집된 데이터를 확인하고 있습니다.</h4></div>
             ) : error ? (
@@ -1111,15 +1860,36 @@ export default function Home() {
               <>
                 <div className="player-list">
                   {result.items.map((player, index) => (
-                    <article className="player-row" key={`${player.spid}-${player.grade}`}>
+                    <article className="player-row is-clickable" key={`${player.spid}-${player.grade}`} onClick={() => openPlayerDetail(player)}>
                       <span className="list-rank">{String(index + 1).padStart(2, "0")}</span>
                       <PlayerImage spid={player.spid} name={player.name || "선수"} wrapperClassName="player-photo" />
                       <div className="player-identity">
                         <div><SeasonBadge season={player.season} image={player.seasonImage} /><EnhancementBadge grade={player.grade} /></div>
                         <h4>{player.name || "선수명 정보 없음"}</h4>
+                        <p className="player-list-data"><span>OVR <b className={player.ovr != null && player.ovr >= 40 ? `ability-over-${Math.min(150, Math.floor(player.ovr / 10) * 10)}` : undefined}>{player.ovr ?? "정보 없음"}</b></span><span>{player.price ? `${squadPriceLabel(player.price)} BP` : "가격 정보 없음"}</span></p>
                       </div>
                       <div className="pick-meter">
-                        <div><span>사용 {player.count.toLocaleString()}명</span><b>{player.pickRate.toFixed(2)}%</b></div>
+                        <div>
+                          <div className="pick-meter-label">
+                            <span>사용 {player.count.toLocaleString()}명</span>
+                          </div>
+                          <div className="pick-meter-value">
+                            <b>{player.pickRate.toFixed(2)}%</b>
+                            <div className="pick-actions">
+                              <button aria-label={`${player.name || "선수"} 상세 보기`} title="선수 상세" type="button" onClick={(event) => { event.stopPropagation(); openPlayerDetail(player); }}>
+                                <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="5.5" /><path d="m15 15 4 4" /></svg>
+                              </button>
+                              <button
+                                aria-label={`${player.name || "선수"} 비교 선수로 선택`}
+                                aria-pressed={comparisonPlayer?.spid === player.spid && comparisonPlayer?.grade === player.grade}
+                                className={comparisonPlayer?.spid === player.spid && comparisonPlayer?.grade === player.grade ? "selected" : ""}
+                                title="선수 비교"
+                                type="button"
+                                onClick={(event) => { event.stopPropagation(); void togglePlayerComparison(player); }}
+                              >{comparisonPlayer?.spid === player.spid && comparisonPlayer?.grade === player.grade ? "✓" : "VS"}</button>
+                            </div>
+                          </div>
+                        </div>
                         <div className="meter-track"><i style={{ width: `${player.pickRate}%` }} /></div>
                       </div>
                     </article>
@@ -1136,44 +1906,72 @@ export default function Home() {
             )}
           </div>
         </div>
+        </div>
       </section>
 
-      <section className="user-search-section" id="user-search">
+      {playerModalMode && <div className="player-detail-modal-overlay" onMouseDown={(event) => { if (event.target === event.currentTarget) closePlayerModal(); }}>
+        <section className={`player-detail-modal mode-${playerModalMode}`} role="dialog" aria-modal="true" aria-label={playerModalMode === "compare" ? "선수 비교" : undefined} aria-labelledby={playerModalMode === "compare" ? undefined : "player-detail-modal-title"}>
+          {playerModalMode !== "compare" && <header>
+            <div><p>PLAYER DATA</p><h2 id="player-detail-modal-title">{playerModalMode === "compare" ? "선수 비교" : "선수 상세 정보"}</h2></div>
+            <button aria-label="선수 정보 닫기" type="button" onClick={closePlayerModal}>×</button>
+          </header>}
+          {playerModalLoading && !playerModalItems.length ? <div className="player-detail-modal-state"><span>LOADING</span><p>FC온라인 선수 정보를 불러오고 있습니다.</p></div>
+            : playerModalError && !playerModalItems.length ? <div className="player-detail-modal-state error"><span>FAILED</span><p>{playerModalError}</p></div>
+            : <div className="player-detail-modal-content">
+              {playerModalMode === "compare" && playerModalItems.length === 2 ? <PlayerComparePanel left={playerModalItems[0]} right={playerModalItems[1]} onClose={closePlayerModal} /> : playerModalItems[0] && <div className="player-detail-modal-column" key={`${playerModalItems[0].spid}-${playerModalItems[0].grade}`}><PlayerDetailPanel player={playerModalItems[0]} controls={<div className="player-detail-controls">
+                <label><span>적응도</span><select aria-label="적응도" value={playerDetailAdaptation} disabled={playerModalLoading} onChange={(event) => changePlayerDetailAdaptation(Number(event.target.value))}>{Array.from({ length: 6 }, (_, value) => <option key={value} value={value}>{value}</option>)}</select></label>
+                <label><span>강화 단계</span><select aria-label="강화 단계" value={playerDetailGrade} disabled={playerModalLoading} onChange={(event) => changePlayerDetailGrade(Number(event.target.value))}>{Array.from({ length: 13 }, (_, index) => index + 1).map((grade) => <option key={grade} value={grade}>+{grade}</option>)}</select></label>
+                {(playerModalLoading || playerModalError) && <p aria-live="polite">{playerModalLoading ? "변경 내용을 반영하고 있습니다." : playerModalError}</p>}
+              </div>} /></div>}
+            </div>}
+        </section>
+      </div>}</>}
+
+      {showsManagers && <><section className={`user-search-section${!profileLoading && !profileError && !profileResult ? " is-initial" : ""}`} id="user-search">
         <div className="user-search-heading">
-          <div><p className="section-kicker">MANAGER PROFILE</p><h2>구단주 검색</h2><p>닉네임으로 순위 변화, 스쿼드와 최근 경기를 확인하세요.</p></div>
+          <div><p className="section-kicker">MANAGER PROFILE</p><h2>구단주 검색</h2></div>
+        </div>
+
+        <div className="manager-search-panel">
           <form className="profile-search-form" onSubmit={searchProfile}>
-            <NicknameAutocomplete id="profile-nickname" label="구단주 닉네임" value={profileNickname} onChange={setProfileNickname} />
+            <NicknameAutocomplete id="profile-nickname" label="구단주 닉네임" value={profileNickname} onChange={changeProfileNickname} />
             <button type="submit" disabled={profileLoading}>{profileLoading ? "검색 중" : "검색"}</button>
           </form>
-        </div>
 
         {profileError ? <div className="profile-empty error">{profileError}</div> : profileLoading ? <div className="profile-empty">구단주 정보를 불러오는 중입니다.</div> : profileResult ? (
           <div className="profile-dashboard">
-            <div className="profile-summary">
-              <div><span>{profileResult.profile.rank.toLocaleString()}위</span><h3>{profileResult.profile.nickname}</h3><p>{profileResult.profile.primaryTeamColor || "팀컬러 없음"} · {profileResult.profile.formation || "포메이션 정보 없음"}</p></div>
-              <dl>
-                <div><dt>구단가치</dt><dd>{clubValueLabel(profileResult.profile.clubValue)}</dd></div>
-                <div><dt>최근 승률</dt><dd>{profileResult.profile.winRate == null ? "정보 없음" : `${profileResult.profile.winRate.toFixed(1)}%`}</dd></div>
-                <div><dt>경기 기록</dt><dd>{integerLabel(profileResult.profile.wins)}승 {integerLabel(profileResult.profile.draws)}무 {integerLabel(profileResult.profile.losses)}패</dd></div>
-                <div><dt>점수</dt><dd>{profileResult.profile.elo?.toLocaleString(undefined, { minimumFractionDigits: 2 }) ?? "정보 없음"}</dd></div>
-              </dl>
+            <div className="profile-summary manager-profile-summary">
+              <div className="manager-summary-identity">
+                {profileResult.profile.teamImage ? <span className="manager-summary-emblem" style={{ "--manager-emblem": `url(${JSON.stringify(profileResult.profile.teamImage)})` } as CSSProperties}><img src={profileResult.profile.teamImage} alt="" /></span> : <span className="manager-summary-crest-missing" aria-hidden="true">FC</span>}
+                <div><span>{profileResult.profile.rank.toLocaleString()}위</span><h3>{profileResult.profile.nickname}</h3>{liveProfileResult?.level != null && <b>LV {liveProfileResult.level.toLocaleString()}</b>}</div>
+                <p>구단 가치 <strong>{clubValueLabel(profileResult.profile.clubValue)}</strong><i aria-hidden="true" />{profileResult.profile.primaryTeamColor || "팀컬러 없음"}</p>
+              </div>
+              <div className="manager-summary-record-slot" aria-hidden="true" />
+              <section className="manager-summary-stat manager-summary-recent"><span>최근 10경기</span><strong>{matches.slice(0, 10).filter((match) => match.self?.result === "승").length}승 {matches.slice(0, 10).filter((match) => match.self?.result === "무").length}무 {matches.slice(0, 10).filter((match) => match.self?.result === "패").length}패 ({matches.slice(0, 10).length ? `${((matches.slice(0, 10).filter((match) => match.self?.result === "승").length / matches.slice(0, 10).length) * 100).toFixed(1)}%` : "0.0%"})</strong><div>{matches.slice(0, 10).map((match) => <i className={`result-${match.self?.result || "없음"}`} key={match.matchId}>{match.self?.result === "승" ? "W" : match.self?.result === "무" ? "D" : "L"}</i>)}</div></section>
+              <section className="manager-summary-tier"><span>최고 등급</span>{liveProfileResult?.maxDivision?.divisionImage && <img className="manager-tier-image" src={liveProfileResult.maxDivision.divisionImage} alt="" />}<strong>{liveProfileResult?.maxDivision?.divisionName || "정보 없음"}</strong>{liveProfileResult?.maxDivision?.achievementDate && <small>{liveProfileResult.maxDivision.achievementDate.slice(0, 10)}</small>}</section>
             </div>
 
-            <div className="history-toolbar"><span>기록 조회 단위</span><HistoryFrameToggle value={historyFrame} onChange={setHistoryFrame} /></div>
-            <small className="history-navigation-guide">차트를 좌우로 드래그하거나 휠을 움직이면 이전 기록을 볼 수 있습니다.</small>
-            <div className="history-grid">
-              <HistoryChart title="순위 변화" items={aggregateHistory(profileResult.history, historyFrame)} frame={historyFrame} value={(item) => item.rank} format={(item) => `${item.rank.toLocaleString()}위`} formatPoint={(point) => `${Math.round(point).toLocaleString()}위`} change={rankHistoryChange} lowerIsHigher />
-              <HistoryChart title="구단가치 변화" items={aggregateHistory(profileResult.history, historyFrame)} frame={historyFrame} value={(item) => Number(BigInt(item.clubValue) / 1_000_000_000_000n)} format={(item) => clubValueLabel(item.clubValue)} formatPoint={historyClubValueLabel} change={clubValueHistoryChange} />
-              <HistoryChart title="승률 변화" items={aggregateHistory(profileResult.history, historyFrame)} frame={historyFrame} value={(item) => item.winRate} format={(item) => item.winRate == null ? "정보 없음" : `${item.winRate.toFixed(1)}%`} formatPoint={(point) => `${point.toFixed(1)}%`} change={winRateHistoryChange} />
+            <div className="manager-metrics-action">
+              <button type="button">지표 보기</button>
             </div>
 
             <div className="profile-block">
               <SquadSection nickname={profileResult.profile.nickname} formation={profileResult.profile.formation} squad={profileResult.squad} />
             </div>
 
+            <div className="history-controls">
+              <div className="history-toolbar"><HistoryFrameToggle value={historyFrame} onChange={setHistoryFrame} /></div>
+              <small className="history-navigation-guide">차트를 좌우로 드래그하거나 휠을 움직이면 이전 기록을 볼 수 있습니다.</small>
+            </div>
+            <div className="history-grid">
+              <HistoryChart title="랭킹 변화" items={aggregateHistory(profileResult.history, historyFrame)} frame={historyFrame} value={(item) => item.rank} format={(item) => `${item.rank.toLocaleString()}위`} formatPoint={(point) => `${Math.round(point).toLocaleString()}위`} change={rankHistoryChange} lowerIsHigher visibleScale minimumScalePadding={0.5} />
+              <HistoryChart title="구단가치 변화" items={aggregateHistory(profileResult.history, historyFrame)} frame={historyFrame} value={(item) => historyClubValuePoint(item.clubValue)} format={(item) => clubValueLabel(item.clubValue)} formatPoint={historyClubValueLabel} change={clubValueHistoryChange} visibleScale scalePaddingRatio={0.1} minimumScalePadding={0.1} />
+              <HistoryChart title="승률 변화" items={aggregateHistory(profileResult.history, historyFrame)} frame={historyFrame} value={(item) => item.winRate} format={(item) => item.winRate == null ? "정보 없음" : `${item.winRate.toFixed(1)}%`} formatPoint={(point) => `${point.toFixed(1)}%`} change={winRateHistoryChange} visibleScale minimumScalePadding={0.1} />
+            </div>
+
             <div className="profile-block match-block">
-              <div className="profile-block-heading"><div><span>RECENT MATCHES</span><h3>최근 경기</h3></div><b>{matches.length}경기</b></div>
-              <div className="matches-layout">
+              <div className="profile-block-heading"><div><span>RECENT MATCHES</span><h3>최근 경기</h3><p className="manager-match-record">{integerLabel(profileResult.profile.wins)}승 {integerLabel(profileResult.profile.draws)}무 {integerLabel(profileResult.profile.losses)}패({profileResult.profile.winRate == null ? "정보 없음" : `${profileResult.profile.winRate.toFixed(1)}%`})</p></div></div>
+              <div className={`matches-layout${selectedMatch ? " detail-open" : ""}`}>
                 <div className="match-list">
                   {matches.length === 0 && !matchesLoading ? <div className="profile-empty">최근 감독모드 경기가 없습니다.</div> : matches.map((match) => (
                     <button className={selectedMatch?.matchId === match.matchId ? "selected" : ""} type="button" key={match.matchId} onClick={() => setSelectedMatch(match)}>
@@ -1199,15 +1997,37 @@ export default function Home() {
               </div>
             </div>
           </div>
+        ) : liveProfileResult ? (
+          <div className="profile-dashboard">
+            <div className="profile-summary manager-profile-summary">
+              <div className="manager-summary-identity">
+                <span className="manager-summary-crest-missing" aria-hidden="true">FC</span>
+                <div><span>랭킹 정보 없음</span><h3>{liveProfileResult.nickname}</h3>{liveProfileResult.level != null && <b>LV {liveProfileResult.level.toLocaleString()}</b>}</div>
+                <p>구단 가치 <strong>{liveProfileResult.squad?.totalPrice == null ? "정보 없음" : `${liveProfileResult.squad.totalPrice.toLocaleString()} BP`}</strong></p>
+              </div>
+              <div className="manager-summary-record-slot" aria-hidden="true" />
+              <section className="manager-summary-stat manager-summary-recent"><span>최근 10경기</span><strong>경기 정보 없음</strong></section>
+              <section className="manager-summary-tier"><span>최고 등급</span>{liveProfileResult.maxDivision?.divisionImage && <img className="manager-tier-image" src={liveProfileResult.maxDivision.divisionImage} alt="" />}<strong>{liveProfileResult.maxDivision?.divisionName || "정보 없음"}</strong>{liveProfileResult.maxDivision?.achievementDate && <small>{liveProfileResult.maxDivision.achievementDate.slice(0, 10)}</small>}</section>
+            </div>
+          </div>
         ) : <div className="profile-empty">구단주를 검색하면 저장된 정보와 최근 경기가 표시됩니다.</div>}
+        </div>
       </section>
 
-      <section className="ranking-section" id="ranking">
+      <ResponsiveAd label="구단주 검색 다음 광고" /></>}
+
+      {showsRanking && <><section className="ranking-section" id="ranking">
+        <nav className="meta-ranking-tabs ranking-category-tabs" role="tablist" aria-label="랭킹 선택">
+          <button type="button" role="tab" aria-selected={rankingCategory === "managers"} className={rankingCategory === "managers" ? "is-active" : ""} onClick={() => selectRankingCategory("managers")}>감독모드 랭킹</button>
+          <button type="button" role="tab" aria-selected={rankingCategory === "formations"} className={rankingCategory === "formations" ? "is-active" : ""} onClick={() => selectRankingCategory("formations")}>포메이션 랭킹</button>
+          <button type="button" role="tab" aria-selected={rankingCategory === "team-colors"} className={rankingCategory === "team-colors" ? "is-active" : ""} onClick={() => selectRankingCategory("team-colors")}>팀컬러 랭킹</button>
+        </nav>
+        {rankingCategory === "managers" ? <>
         <div className="ranking-heading">
           <div>
             <p className="section-kicker">MANAGER MODE RANKING</p>
             <h2>감독모드 랭킹</h2>
-            <p className="ranking-description">FC 온라인 감독모드 상위 10,000명의 순위와 팀 정보를 확인하세요.</p>
+            <p className="ranking-description">FC 온라인 감독모드 상위 10,000명의 랭킹과 팀 정보를 확인하세요.</p>
           </div>
           <div className="ranking-controls">
             <form className="ranking-search" onSubmit={searchRanking}>
@@ -1225,7 +2045,7 @@ export default function Home() {
             <p>{rankingResult ? `${rankingResult.total.toLocaleString()}명 · ${simpleSnapshotLabel(rankingResult.snapshot.data_time)}` : "데이터 없음"}</p>
           </div>
           <div className="ranking-table-head" aria-hidden="true">
-            <span>순위</span><span>구단주</span><span>팀컬러</span><span>포메이션</span><span>점수</span><span>승률</span><span>구단가치</span>
+            <span>랭킹</span><span>구단주</span><span>팀컬러</span><span>포메이션</span><span>점수</span><span>승률</span><span>구단가치</span>
           </div>
 
           {rankingLoading ? (
@@ -1268,12 +2088,11 @@ export default function Home() {
           ) : (
             <div className="ranking-empty">조건에 맞는 실제 랭킹 데이터가 없습니다.</div>
           )}
-
           {!rankingSearchActive && rankingResult && rankingResult.total > 0 && (
             <nav className="ranking-pagination" aria-label="랭킹 페이지">
               <button type="button" disabled={rankingLoading || rankingPage === 1} onClick={() => void fetchRankings(rankingTeam, rankingPage - 1, true)}>이전</button>
               <div>
-                {paginationItems(rankingPage, Math.ceil(rankingResult.total / 20)).map((item, index) =>
+                {paginationItems(rankingPage, Math.ceil(rankingResult.total / rankingPageSize)).map((item, index) =>
                   item === "ellipsis" ? <span key={`ellipsis-${index}`}>···</span> : (
                     <button
                       className={rankingPage === item ? "current" : ""}
@@ -1286,11 +2105,14 @@ export default function Home() {
                   ),
                 )}
               </div>
-              <button type="button" disabled={rankingLoading || rankingPage === Math.ceil(rankingResult.total / 20)} onClick={() => void fetchRankings(rankingTeam, rankingPage + 1, true)}>다음</button>
+              <button type="button" disabled={rankingLoading || rankingPage === Math.ceil(rankingResult.total / rankingPageSize)} onClick={() => void fetchRankings(rankingTeam, rankingPage + 1, true)}>다음</button>
             </nav>
           )}
         </div>
+        </> : <MetaRankingContent activeTab={rankingCategory} />}
       </section>
+
+      {rankingCategory === "managers" ? <ResponsiveAd label="랭킹 다음 광고" /> : null}
 
       {modalNickname && (
         <div className="ranker-modal-overlay" onMouseDown={(event) => { if (event.target === event.currentTarget) closeRankerModal(); }}>
@@ -1321,9 +2143,9 @@ export default function Home() {
                       <div className="history-toolbar"><span>기록 조회 단위</span><HistoryFrameToggle value={modalHistoryFrame} onChange={setModalHistoryFrame} /></div>
                       <small className="history-navigation-guide">차트를 좌우로 드래그하거나 휠을 움직이면 이전 기록을 볼 수 있습니다.</small>
                       <div className="history-grid">
-                        <HistoryChart title="순위 변화" items={aggregateHistory(modalProfile.history, modalHistoryFrame)} frame={modalHistoryFrame} value={(item) => item.rank} format={(item) => `${item.rank.toLocaleString()}위`} formatPoint={(point) => `${Math.round(point).toLocaleString()}위`} change={rankHistoryChange} lowerIsHigher />
-                        <HistoryChart title="구단가치 변화" items={aggregateHistory(modalProfile.history, modalHistoryFrame)} frame={modalHistoryFrame} value={(item) => Number(BigInt(item.clubValue) / 1_000_000_000_000n)} format={(item) => clubValueLabel(item.clubValue)} formatPoint={historyClubValueLabel} change={clubValueHistoryChange} />
-                        <HistoryChart title="승률 변화" items={aggregateHistory(modalProfile.history, modalHistoryFrame)} frame={modalHistoryFrame} value={(item) => item.winRate} format={(item) => item.winRate == null ? "정보 없음" : `${item.winRate.toFixed(1)}%`} formatPoint={(point) => `${point.toFixed(1)}%`} change={winRateHistoryChange} />
+                        <HistoryChart title="랭킹 변화" items={aggregateHistory(modalProfile.history, modalHistoryFrame)} frame={modalHistoryFrame} value={(item) => item.rank} format={(item) => `${item.rank.toLocaleString()}위`} formatPoint={(point) => `${Math.round(point).toLocaleString()}위`} change={rankHistoryChange} lowerIsHigher visibleScale minimumScalePadding={0.5} />
+                        <HistoryChart title="구단가치 변화" items={aggregateHistory(modalProfile.history, modalHistoryFrame)} frame={modalHistoryFrame} value={(item) => historyClubValuePoint(item.clubValue)} format={(item) => clubValueLabel(item.clubValue)} formatPoint={historyClubValueLabel} change={clubValueHistoryChange} visibleScale scalePaddingRatio={0.1} minimumScalePadding={0.1} />
+                        <HistoryChart title="승률 변화" items={aggregateHistory(modalProfile.history, modalHistoryFrame)} frame={modalHistoryFrame} value={(item) => item.winRate} format={(item) => item.winRate == null ? "정보 없음" : `${item.winRate.toFixed(1)}%`} formatPoint={(point) => `${point.toFixed(1)}%`} change={winRateHistoryChange} visibleScale minimumScalePadding={0.1} />
                       </div>
                     </div>
                   )}
@@ -1333,7 +2155,7 @@ export default function Home() {
                     </div>
                   )}
                   {modalTab === "matches" && (
-                    <div className="modal-content-block matches-layout">
+                    <div className={`modal-content-block matches-layout${modalSelectedMatch ? " detail-open" : ""}`}>
                       <div className="match-list">
                         {modalMatches.length > 0 ? modalMatches.map((match) => (
                           <button className={modalSelectedMatch?.matchId === match.matchId ? "selected" : ""} type="button" key={match.matchId} onClick={() => setModalSelectedMatch(match)}>
@@ -1355,13 +2177,54 @@ export default function Home() {
             </div>
           </section>
         </div>
-      )}
+      )}</>}
 
-      <CommunitySection />
+      {showsFaq && <section className="faq-section" id="support">
+        <div className="faq-heading">
+          <p className="section-kicker">SUPPORT / FAQ</p>
+          <h2>자주 묻는 질문</h2>
+        </div>
+        <div className="faq-list">
+          <details><summary>게임 닉네임은 다른 사람에게 공개되나요?</summary><p>회원가입 때 공개 여부를 직접 선택합니다. 비공개로 설정하면 본인과 운영자만 확인할 수 있습니다.</p></details>
+          <details><summary>로그인에 문제가 있어요.</summary><p>FC-SUPPORT는 Google 로그인만 사용합니다. Google 계정 접근이나 복구가 필요한 경우 Google 계정 고객센터에서 확인해 주세요.</p></details>
+          <details><summary>데이터가 실제 게임과 다르게 보여요.</summary><p>NEXON Open API와 수집 시점에 따라 반영이 늦거나 일부 기록이 없을 수 있습니다. 오류는 고객센터 이메일로 알려주세요.</p></details>
+        </div>
+        <div className="faq-contact-actions">
+          <a className="faq-contact-link" href="/community?compose=inquiry">사이트에서 문의·건의 남기기</a>
+          <a className="faq-contact-link faq-contact-link-secondary" href="mailto:fc-support@naver.com?subject=FC-SUPPORT 문의·건의">이메일로 문의하기 · fc-support@naver.com</a>
+        </div>
+      </section>}
 
-      <PortfolioSection />
-
-      <footer><a className="brand footer-brand" href="#top"><span className="brand-mark">FC</span><span>SUPPORT</span></a><p>Data based on NEXON Open API</p><small>FC-SUPPORT is not associated with or endorsed by NEXON Korea.</small></footer>
+      {/* Previous home-only footer retained but disabled.
+        <footer className="site-footer">
+          <div className="footer-frame">
+            <div className="footer-frame-head">
+              <a className="brand footer-brand" href="#top" aria-label="FC-SUPPORT 홈으로"><span className="brand-mark">FC</span><span>SUPPORT</span></a>
+              <span><i /> NEXON OPEN API DATA</span>
+            </div>
+            <div className="footer-main-copy">
+              <p className="footer-index">FC / 01</p>
+              <h2>감독모드의 흐름을<br />데이터로 읽습니다.</h2>
+              <p>NEXON Open API 데이터를 바탕으로 랭킹, 스쿼드와 경기 정보를 정리합니다.</p>
+            </div>
+            <nav className="footer-links" aria-label="하단 운영 메뉴">
+              <a href="/privacy"><span>01</span><b>개인정보처리방침</b></a>
+              <a href="/terms"><span>02</span><b>이용약관</b></a>
+              <a href="/community?compose=inquiry"><span>03</span><b>게시물 신고·운영 문의</b></a>
+            <a href="/faq"><span>04</span><b>FAQ · 문의 · 건의</b></a>
+            </nav>
+            <div className="footer-contact">
+              <span>CONTACT · PREPARING</span>
+              <strong>fc-support@naver.com</strong>
+            </div>
+            <div className="footer-legal">
+              <p>FC-SUPPORT는 ㈜넥슨코리아의 공식 서비스가 아닙니다. 본 사이트는 NEXON Open API를 사용하며, API·관련 상표·제공 데이터의 저작권 등 제반 권리는 ㈜넥슨코리아 또는 정당한 권리자에게 있습니다.</p>
+            </div>
+            <div className="footer-bottom"><small>© {new Date().getFullYear()} FC-SUPPORT · DATA BASED ON NEXON OPEN API</small><a href="/">BACK TO TOP ↑</a></div>
+          </div>
+        </footer>
+      */}
+      <SiteFooter />
     </main>
   );
 }

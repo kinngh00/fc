@@ -34,6 +34,17 @@ async function call(baseUrl, pathname, { method = "GET", cookie = "", body, head
   return { response, payload, cookie: response.headers.get("set-cookie")?.split(";", 1)[0] || "" };
 }
 
+function registrationBody(input) {
+  return {
+    termsAccepted: true,
+    privacyAccepted: true,
+    gameNickname: "테스트구단",
+    securityQuestion: "어린 시절 가장 기억에 남는 장소는 어디인가요?",
+    securityAnswer: "테스트답변",
+    ...input,
+  };
+}
+
 test("community auth, public reads, member writes and owner deletes", async (context) => {
   const directory = mkdtempSync(path.join(tmpdir(), "fc-support-community-"));
   const port = 19000 + (process.pid % 1000);
@@ -84,19 +95,19 @@ test("community auth, public reads, member writes and owner deletes", async (con
   const rejectedOrigin = await call(baseUrl, "/api/auth/register", {
     method: "POST",
     headers: { origin: "https://untrusted.example" },
-    body: { loginId: "blocked_01", nickname: "차단회원", password: "secure-pass-00" },
+    body: registrationBody({ loginId: "blocked_01", nickname: "차단회원", password: "secure-pass-00" }),
   });
   assert.equal(rejectedOrigin.response.status, 403);
 
   const anonymousCreate = await call(baseUrl, "/api/community/posts", { method: "POST", body: { title: "테스트", content: "내용입니다." } });
   assert.equal(anonymousCreate.response.status, 401);
 
-  const registration = await call(baseUrl, "/api/auth/register", { method: "POST", headers: { "x-forwarded-proto": "https" }, body: { loginId: "owner_01", nickname: "작성자", password: "secure-pass-01" } });
+  const registration = await call(baseUrl, "/api/auth/register", { method: "POST", headers: { "x-forwarded-proto": "https" }, body: registrationBody({ loginId: "owner_01", nickname: "작성자", password: "secure-pass-01" }) });
   assert.equal(registration.response.status, 201);
   assert.ok(registration.cookie.startsWith("fc_support_session="));
   assert.match(registration.response.headers.get("set-cookie"), /; Secure/);
   for (const nickname of ["밑줄_금지", "공백 금지", "기호!금지"]) {
-    const invalidNickname = await call(baseUrl, "/api/auth/register", { method: "POST", body: { loginId: `bad${nickname.length}${nickname.charCodeAt(0)}`, nickname, password: "secure-pass-03" } });
+    const invalidNickname = await call(baseUrl, "/api/auth/register", { method: "POST", body: registrationBody({ loginId: `bad${nickname.length}${nickname.charCodeAt(0)}`, nickname, password: "secure-pass-03" }) });
     assert.equal(invalidNickname.response.status, 400);
     assert.equal(invalidNickname.payload.code, "INVALID_NICKNAME");
   }
@@ -104,7 +115,7 @@ test("community auth, public reads, member writes and owner deletes", async (con
   const me = await call(baseUrl, "/api/auth/me", { cookie: registration.cookie });
   assert.equal(me.payload.user.nickname, "작성자");
 
-  const duplicateRegistration = await call(baseUrl, "/api/auth/register", { method: "POST", body: { loginId: "owner_01", nickname: "중복회원", password: "secure-pass-01" } });
+  const duplicateRegistration = await call(baseUrl, "/api/auth/register", { method: "POST", body: registrationBody({ loginId: "owner_01", nickname: "중복회원", password: "secure-pass-01" }) });
   assert.equal(duplicateRegistration.response.status, 409);
   const invalidLogin = await call(baseUrl, "/api/auth/login", { method: "POST", body: { loginId: "owner_01", password: "wrong-password" } });
   assert.equal(invalidLogin.response.status, 401);
@@ -160,7 +171,7 @@ test("community auth, public reads, member writes and owner deletes", async (con
   const editComment = await call(baseUrl, `/api/community/comments/${comment.payload.id}`, { method: "PATCH", cookie: ownerCookie, body: { content: "수정 댓글" } });
   assert.equal(editComment.response.status, 200);
 
-  const secondRegistration = await call(baseUrl, "/api/auth/register", { method: "POST", body: { loginId: "reader_02", nickname: "다른회원", password: "secure-pass-02" } });
+  const secondRegistration = await call(baseUrl, "/api/auth/register", { method: "POST", body: registrationBody({ loginId: "reader_02", nickname: "다른회원", password: "secure-pass-02" }) });
   assert.equal(secondRegistration.response.status, 201);
   const forbiddenPostDelete = await call(baseUrl, `/api/community/posts/${creation.payload.id}`, { method: "DELETE", cookie: secondRegistration.cookie });
   assert.equal(forbiddenPostDelete.response.status, 403);

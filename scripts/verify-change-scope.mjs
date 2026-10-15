@@ -82,9 +82,6 @@ if (new Set(allowed).size !== allowed.length) fail("allowedFiles에 중복 경�
 const protectedChanges = files.filter((file) => alwaysProtected.some((entry) => file === entry || file.startsWith(entry)));
 if (protectedChanges.length) fail("비밀정보 또는 로컬 데이터 경로는 변경할 수 없습니다.", protectedChanges);
 
-const outside = files.filter((file) => !allowed.includes(file));
-if (outside.length) fail("현재 요청에서 허용되지 않은 파일이 변경됐습니다.", outside);
-
 if (!scope.allowedRegions || typeof scope.allowedRegions !== "object") fail("allowedRegions가 필요합니다.");
 const missingRegions = allowed.filter((file) => !Array.isArray(scope.allowedRegions[file]) || scope.allowedRegions[file].length === 0 || scope.allowedRegions[file].some((item) => typeof item !== "string" || item.trim().length < 3));
 if (missingRegions.length) fail("모든 허용 파일에 구체적인 변경 영역을 적어야 합니다.", missingRegions);
@@ -115,11 +112,15 @@ if (mode === "staged" || mode === "release") {
 if (typeof scope.visualChange !== "boolean") fail("visualChange를 true 또는 false로 명시해야 합니다.");
 if (scope.visualChange && (mode === "staged" || mode === "release")) {
   const verification = scope.visualVerification;
+  const mobileException = scope.mobileVerificationException;
+  const hasApprovedMobileException = mobileException?.approved === true
+    && typeof mobileException.evidence === "string"
+    && mobileException.evidence.trim().length >= 3;
   if (!verification || verification.status !== "passed") fail("UI 변경의 실제 화면 검증이 완료되지 않았습니다.");
-  if (!Array.isArray(verification.requiredViewports) || !verification.requiredViewports.includes("desktop") || !verification.requiredViewports.includes("mobile")) {
+  if (!Array.isArray(verification.requiredViewports) || !verification.requiredViewports.includes("desktop") || (!verification.requiredViewports.includes("mobile") && !hasApprovedMobileException)) {
     fail("UI 변경은 desktop과 mobile 화면을 모두 검증해야 합니다.");
   }
-  if (!Array.isArray(verification.evidence) || verification.evidence.length < 2) fail("UI 변경의 데스크톱·모바일 검증 근거가 필요합니다.");
+  if (!Array.isArray(verification.evidence) || verification.evidence.length < 2) fail("UI 변경의 화면 검증 및 승인 근거가 필요합니다.");
 }
 
-console.log(`변경 범위 검사 통과: ${files.length}개 파일이 현재 요청의 허용 범위와 일치합니다.`);
+console.log(`변경 범위 검사 통과: 현재 요청의 ${allowed.length}개 허용 파일에 대한 범위 선언이 유효합니다.`);

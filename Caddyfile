@@ -1,0 +1,14 @@
+{
+  email fc-support@naver.com
+}
+
+fc-support.kr {
+  encode zstd gzip
+  handle /api/* {
+    reverse_proxy 127.0.0.1:8787
+  }
+
+  handle {
+    reverse_proxy 127.0.0.1:3000
+  }
+}

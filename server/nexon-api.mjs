@@ -4,6 +4,15 @@ function wait(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+function retryDelay(response, attempt) {
+  const value = response.headers.get("retry-after");
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds > 0) return seconds * 1000;
+  const date = Date.parse(value || "");
+  if (Number.isFinite(date) && date > Date.now()) return date - Date.now();
+  return 750 * 2 ** attempt;
+}
+
 export class NexonApiError extends Error {
   constructor(message, { status = 0, retryable = false } = {}) {
     super(message);
@@ -19,6 +28,7 @@ export async function nexonJson(path, apiKey) {
     try {
       const response = await fetch(`${API_ROOT}${path}`, {
         headers: { accept: "application/json", "x-nxopen-api-key": apiKey },
+        signal: AbortSignal.timeout(15_000),
       });
       if (response.ok) return await response.json();
 
@@ -30,12 +40,11 @@ export async function nexonJson(path, apiKey) {
       );
       if (!retryable) throw error;
       lastError = error;
-      const retryAfter = Number(response.headers.get("retry-after"));
-      await wait(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 750 * 2 ** attempt);
+      if (attempt < 5) await wait(retryDelay(response, attempt));
     } catch (error) {
       if (error instanceof NexonApiError && !error.retryable) throw error;
       lastError = error;
-      await wait(750 * 2 ** attempt);
+      if (attempt < 5) await wait(750 * 2 ** attempt);
     }
   }
   throw lastError;
@@ -75,6 +84,18 @@ export async function mapWithKeyPool(items, keys, concurrencyPerKey, mapper, { o
 
 export function nicknamePath(nickname) {
   return `/fconline/v1/id?nickname=${encodeURIComponent(nickname)}`;
+}
+
+export function userBasicPath(ouid) {
+  return `/fconline/v1/user/basic?ouid=${encodeURIComponent(ouid)}`;
+}
+
+export function userMaxDivisionPath(ouid) {
+  return `/fconline/v1/user/maxdivision?ouid=${encodeURIComponent(ouid)}`;
+}
+
+export function divisionMetadataPath() {
+  return "/static/fconline/meta/division.json";
 }
 
 export function latestManagerMatchPath(ouid, offset = 0, limit = 1) {

@@ -71,7 +71,7 @@ async function prepareRelease() {
     "server/index.mjs",
   ], {
     cwd: releaseDir,
-    env: { ...commonEnv, FC_BACKEND_PORT: String(backendPorts[slot]), FC_FRONTEND_ORIGIN: "http://localhost:3000" },
+    env: { ...commonEnv, FC_BACKEND_PORT: String(backendPorts[slot]), FC_FRONTEND_ORIGIN: "https://fc-support.kr" },
     logName: `backend-${releaseId}`,
   });
   const frontendPid = spawnDetached(process.execPath, [
